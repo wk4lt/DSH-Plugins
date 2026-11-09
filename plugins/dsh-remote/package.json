@@ -1,6 +1,6 @@
 {
   "name": "@wk4lt/dsh-remote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Map local DSH workspaces to SSH directories and run remote development tasks.",
   "license": "MIT",
   "author": "flymysql <flyphp@outlook.com>",
@@ -76,12 +76,6 @@
     "iconv-lite": "^0.7.3",
     "ssh2": "^1.16.0"
   },
-  "bundleDependencies": [
-    "ssh2",
-    "asn1",
-    "bcrypt-pbkdf",
-    "tweetnacl"
-  ],
   "devDependencies": {
     "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
     "react": "^18.3.1",
