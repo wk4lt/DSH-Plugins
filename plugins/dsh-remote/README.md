@@ -9,7 +9,7 @@
 在仓库根目录运行。已安装上游 `dsh-remote` 的 profile 应先卸载该 bundle，再安装此版本。两个版本使用同一套远程工具名和本机 SSH 数据。
 
 ```bash
-dsh plugin --profile web add file:./plugins/dsh-remote --ignore-scripts
+dsh plugin --profile web add file:./plugins/dsh-remote
 dsh web
 ```
 
@@ -19,18 +19,18 @@ dsh web
 
 ```powershell
 $Registry = 'https://npm-mirror.example.internal/'
-dsh plugin --profile desktop add 'file:./plugins/dsh-remote' --registry $Registry --ignore-scripts
+dsh plugin --profile desktop add 'file:./plugins/dsh-remote' --registry $Registry
 ```
 
 源码可以直接从 ZIP 解压使用。保留 `file:` 前缀，profile 安装器会安装插件的运行依赖。裸目录路径默认会创建 `link:`，此时依赖必须已经安装在源码目录里。若已通过 `link:` 安装此插件，先用 `dsh plugin --profile desktop remove @wk4lt/dsh-remote` 移除旧链接，再执行安装命令。浏览器版使用对应的 `web` profile。
 
-`--ignore-scripts` 跳过 SSH 依赖的可选原生构建脚本，插件使用 JavaScript 实现。
+插件随包提供裁剪后的 `ssh2@1.17.0`，不包含原生加速模块或安装构建脚本，无需批准 pnpm 构建脚本。加密使用 Node 内置 OpenSSL，Poly1305 使用上游 JavaScript/WebAssembly 实现；SSH/SFTP 功能完整，大批量传输可能略慢于原生加速版本。来源、裁剪内容和升级流程见 [vendor/ssh2/VENDOR.md](vendor/ssh2/VENDOR.md)。
 
 重新打开 DSH 后，在「设置 → 远程工作区」检查「远程服务器」和「目录映射」两栏。运行依赖由内网镜像提供，Host peer 依赖由当前 DSH 提供。安装步骤可以直接使用仓库自带的 `package.json`。
 
 ## 使用
 
-- **设置 → 远程工作区 → 远程服务器**列出已保存的服务器和 SSH 配置中的主机。编辑打开弹窗，测试连接的结果显示在该行。首次使用 SSH 配置中的主机时，打开编辑并保存。
+- **设置 → 远程工作区 → 远程服务器**列出已保存的服务器和 SSH 配置中的主机。点击「添加新机器」填写连接信息并保存；已有服务器可点「编辑」，测试连接的结果显示在该行。首次使用 SSH 配置中的主机时，打开编辑并保存。
 - **目录映射**按服务器分组。展开对应服务器的新增或编辑弹窗，选择已有本地目录并填写远端绝对路径。
 - **工作区选择器 → 远程**选择服务器和远端目录，然后勾选「映射到已有本地目录」。选定目录后以本地 checkout 为会话工作区。复选框关闭时使用原有的托管镜像流程。
 

@@ -99,7 +99,7 @@ window.__ModuleLoader__.load({
         'mapping.remote': '远端目录',
         'mapping.check': '映射到已有本地目录',
         'mapping.typeLocal': '请输入已有本地目录的绝对路径。',
-        'mapping.noServers': '请先在 SSH 配置中添加服务器，再在这里保存。',
+        'mapping.noServers': '点击「添加新机器」添加服务器，也可以编辑并保存 SSH 配置中的主机。',
         'mapping.missingServer': '服务器已移除',
         'mapping.removeConfirm': '解除 {local} 的远端绑定？',
         'mapping.replace': '将 {local} 的远端目标从 {old} 改为 {next}？',
@@ -111,6 +111,8 @@ window.__ModuleLoader__.load({
         'settings.hostListSource': '来自 ~/.ssh/config',
         'settings.hostListLoading': '正在读取 ~/.ssh/config…',
         'settings.hostListRefresh': '刷新',
+        'settings.refreshing': '刷新中…',
+        'settings.refreshed': '已刷新服务器和目录映射。',
         'settings.hostListRefreshHint': '重新读取 ~/.ssh/config（改完文件点这里，不用重开设置页）',
         'settings.hostListEmpty': '没在 {file} 里找到主机。写好 Host 段后点「刷新」。',
         'settings.hostListFailed': '读取失败：{msg}。这不是你的 ssh 配置有问题（文件根本没读到）——点「刷新」重试；一直失败说明插件版本与服务端不一致，重启 DSH 即可。',
@@ -146,6 +148,7 @@ window.__ModuleLoader__.load({
         'settings.clearCurrent': '取消设为当前（active remote = none）',
         'settings.noActive': '当前没有活动远程机：保存的机器只是备用连接，不会自动进入会话上下文（本地会话不受影响）。',
         'settings.editMachine': '编辑机器',
+        'settings.addMachine': '添加新机器',
         'settings.badgeSshConfig': 'ssh cfg',
         // Issue #51 — transport backend (GSSAPI/Kerberos via system OpenSSH).
         'settings.badgeOpenssh': 'openssh',
@@ -379,7 +382,7 @@ window.__ModuleLoader__.load({
         'mapping.remote': 'Remote directory',
         'mapping.check': 'Map to an existing local directory',
         'mapping.typeLocal': 'Enter the absolute path of an existing local directory.',
-        'mapping.noServers': 'Add a server to your SSH config, then save it here.',
+        'mapping.noServers': 'Click Add machine to add a server, or edit and save a host from your SSH config.',
         'mapping.missingServer': 'Server removed',
         'mapping.removeConfirm': 'Unbind the remote target for {local}?',
         'mapping.replace': 'Change the remote target for {local} from {old} to {next}?',
@@ -390,6 +393,8 @@ window.__ModuleLoader__.load({
         'settings.hostListSource': 'from ~/.ssh/config',
         'settings.hostListLoading': 'Reading ~/.ssh/config…',
         'settings.hostListRefresh': 'Refresh',
+        'settings.refreshing': 'Refreshing…',
+        'settings.refreshed': 'Servers and directory mappings refreshed.',
         'settings.hostListRefreshHint': 'Re-read ~/.ssh/config (no need to reopen this page)',
         'settings.hostListEmpty': 'No hosts found in {file}. Add Host blocks, then hit Refresh.',
         'settings.hostListFailed': 'Could not read it: {msg}. This is NOT a problem with your ssh config (the file was never read) — hit Refresh; if it keeps failing the plugin versions are out of sync, so restart DSH.',
@@ -424,6 +429,7 @@ window.__ModuleLoader__.load({
         'settings.clearCurrent': 'Clear current (active remote = none)',
         'settings.noActive': 'No active remote machine: saved machines are standby connections and never enter a session context automatically (local sessions are unaffected).',
         'settings.editMachine': 'Edit machine',
+        'settings.addMachine': 'Add machine',
         'settings.badgeSshConfig': 'ssh cfg',
         // Issue #51 — transport backend (GSSAPI/Kerberos via system OpenSSH).
         'settings.badgeOpenssh': 'openssh',
@@ -830,6 +836,10 @@ window.__ModuleLoader__.load({
           '.dsh-rw-section-btn{width:100%;text-align:left;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;padding:0;color:inherit}',
           '@keyframes dsh-rw-in{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}',
           '.dsh-rw-modal-panel{animation:dsh-rw-in .14s ease-out}',
+          // Modal's default card is 380px wide and clips overflowing children.
+          // Enlarge the card itself without changing the original form layout.
+          '.dsh-rw-settings-dialog.dsh-rw-settings-dialog{width:min(1000px,100%);max-height:100%}',
+          '.dsh-rw-settings-editor-content{min-height:0;overflow:auto}',
         ].join('')
         document.head.appendChild(el)
       } catch { /* vm tests / no DOM */ }
@@ -1026,19 +1036,24 @@ window.__ModuleLoader__.load({
       type: 'button', className: 'dsh-rw-btn', style: primary ? primaryBtnS : buttonS, onClick, disabled,
     }, label)
 
-    function SettingsEditor({ title, close, children }) {
+    function SettingsEditor({ title, close, children, footer }) {
       const backdrop = useBackdropGuard()
-      if (Modal) return h(Modal, { open: true, onClose: close, title, closeLabel: tr('picker.close') },
-        h('div', { style: { width: 'min(590px, 75vw)', maxHeight: '65vh', overflowY: 'auto', padding: 2 } }, children))
+      const contents = h('div', { style: { width: '100%', minWidth: 0 } },
+        children,
+        h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', padding: '6px 0', justifyContent: 'flex-end' } }, footer))
+      if (Modal) return h(Modal, {
+        open: true, onClose: close, title, closeLabel: tr('picker.close'),
+        className: 'dsh-rw-settings-dialog', contentClassName: 'dsh-rw-settings-editor-content',
+      }, contents)
       return portalize(h('div', {
-        style: { position: 'fixed', inset: 0, zIndex: 1000000, background: 'rgba(0,0,0,.45)', display: 'grid', placeItems: 'center' },
+        style: { position: 'fixed', inset: 0, zIndex: 1000000, background: 'rgba(0,0,0,.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, boxSizing: 'border-box' },
         onMouseDown: backdrop.onMouseDown,
         onClick: e => { if (backdrop.onClick(e)) close() },
       }, h('section', {
         role: 'dialog', 'aria-modal': true, 'aria-label': title,
         onKeyDown: e => { if (e.key === 'Escape') close() },
-        style: { ...boxS, background: v('--dsw-alias-bg-layer-1', '#18181b'), color: T.label, width: 'min(610px, 90vw)', maxHeight: '85vh', overflowY: 'auto' },
-      }, h('h3', null, title), children)))
+        style: { ...boxS, background: v('--dsw-alias-bg-layer-1', '#18181b'), color: T.label, width: 'min(1000px, 94vw)', maxHeight: '90vh', overflow: 'auto' },
+      }, h('h3', null, title), contents)))
     }
 
     function LocalMappingDirectory({ value, onChange, onError }) {
@@ -1087,6 +1102,8 @@ window.__ModuleLoader__.load({
       const [mappings, setMappings] = React.useState([])
       const [sshHosts, setSshHosts] = React.useState([])
       const [rowState, setRowState] = React.useState({})
+      const [refreshing, setRefreshing] = React.useState(false)
+      const [refreshStatus, setRefreshStatus] = React.useState('')
       const [form, setForm] = React.useState(null)
       const [editMapping, setEditMapping] = React.useState(null)
       const [advOpen, setAdvOpen] = React.useState(false)
@@ -1107,6 +1124,18 @@ window.__ModuleLoader__.load({
         setSshHosts(result[2].entries || [])
       }
       const reload = () => refresh().catch(error => setErr(error.message))
+      const refreshSettings = async () => {
+        if (refreshing) return
+        setRefreshing(true); setRefreshStatus(''); setErr('')
+        try {
+          await refresh()
+          setRefreshStatus(tr('settings.refreshed'))
+        } catch (error) {
+          setErr(error.message)
+        } finally {
+          setRefreshing(false)
+        }
+      }
       React.useEffect(() => {
         ensureChromeCss()
         reload()
@@ -1123,6 +1152,7 @@ window.__ModuleLoader__.load({
           username: machine.username || '', workspace: machine.workspace || '',
           privateKeyPath: machine.privateKeyPath || '', hostKeyMode: machine.hostKeyMode || '',
           password: '', passphrase: '', encryptPassword: !!(machine.credentialBackend && machine.credentialBackend !== 'plain'),
+          useSshConfig: !!machine.useSshConfig, useAgent: !!machine.useAgent, keyboardInteractive: !!machine.keyboardInteractive,
           proxyHost: machine.proxy?.host || '', proxyPort: String(machine.proxy?.port || 22),
           proxyUser: machine.proxy?.username || '', proxyPassword: '', proxyKey: machine.proxy?.privateKeyPath || '',
           proxyPasswordSet: !!machine.proxy?.passwordSet,
@@ -1221,18 +1251,19 @@ window.__ModuleLoader__.load({
         .filter(id => !machines.some(machine => machine.id === id))
         .map(id => ({ id, name: tr('mapping.missingServer'), missing: true }))]
       const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', padding: '6px 0' }
-      const footerStyle = { ...rowStyle, justifyContent: 'flex-end' }
       const pathStyle = { fontFamily: 'monospace', overflowWrap: 'anywhere', flex: '1 1 240px' }
 
       return h('div', { className: 'dsh-rw-settings', style: { display: 'grid', gap: 12 } },
         !form && !editMapping ? banner(err) : null,
-        h('section', { style: boxS, 'aria-label': tr('mapping.servers') },
+        h('section', { style: boxS, 'aria-label': tr('mapping.servers'), 'aria-busy': refreshing },
           h('div', { style: rowStyle },
             h('h3', { style: { flex: 1, margin: 0 } }, tr('mapping.servers')),
+            settingsButton(tr('settings.addMachine'), () => showServer({ username: 'root', port: 22 }), busy, true),
             settingsButton(tr('settings.openSshConfig'), async () => {
               try { await api('POST', '/dsh-remote/ssh-config', { action: 'open' }) } catch (error) { setErr(error.message) }
             }),
-            settingsButton(tr('settings.hostListRefresh'), reload)),
+            settingsButton(tr(refreshing ? 'settings.refreshing' : 'settings.hostListRefresh'), refreshSettings, refreshing)),
+          refreshStatus ? h('p', { role: 'status', style: { color: T.ok, margin: '6px 0', fontSize: 12 } }, refreshStatus) : null,
           listed.length ? listed.map(machine => {
             const key = machine.id || machine.host
             const result = rowState[key]
@@ -1256,7 +1287,13 @@ window.__ModuleLoader__.load({
                 settingsButton(tr('settings.edit'), () => showMapping(mapping)),
                 settingsButton(tr('mapping.remove'), () => removeMapping(mapping), busy))))
           }) : h('p', null, tr('mapping.noServers'))),
-        form ? h(SettingsEditor, { title: tr('settings.editMachine'), close: closeServer },
+        form ? h(SettingsEditor, {
+          title: tr(form.id ? 'settings.editMachine' : 'settings.addMachine'), close: closeServer,
+          footer: h(React.Fragment, null,
+            settingsButton(tr('file.cancel'), closeServer, busy || tst === 'testing'),
+            settingsButton(tst === 'testing' ? tr('settings.testing') : tr('settings.testConn'), testConn, busy || !form.host.trim() || tst === 'testing'),
+            settingsButton(busy ? tr('settings.saving') : tr('settings.save'), saveServer, busy || !form.host.trim() || tst === 'testing', true)),
+        },
           h(React.Fragment, null,
           row(tr('settings.name'), React.createElement('input', { className: 'dsh-rw-input', value: form.name, onChange: setF('name'), placeholder: tr('settings.name') + ' (e.g. build-server)', style: inputS }), 'n'),
           row(tr('settings.host'), React.createElement('input', { className: 'dsh-rw-input', value: form.host, onChange: setF('host'), placeholder: form.useSshConfig ? tr('settings.sshImport') + ' Host 别名' : 'IP or hostname', style: inputS }), 'h'),
@@ -1355,12 +1392,14 @@ window.__ModuleLoader__.load({
             row(tr('settings.proxyKey'), React.createElement('input', { value: form.proxyKey, onChange: setF('proxyKey'), placeholder: 'Jump private key path (optional)', style: inputS }), 'pk'),
           ) : null),
           banner(err),
-          msg ? h('p', { role: 'status', style: { color: T.ok } }, msg) : null,
-          h('div', { style: footerStyle },
-            settingsButton(tr('file.cancel'), closeServer, busy || tst === 'testing'),
-            settingsButton(tst === 'testing' ? tr('settings.testing') : tr('settings.testConn'), testConn, busy || !form.host.trim() || tst === 'testing'),
-            settingsButton(busy ? tr('settings.saving') : tr('settings.save'), saveServer, busy || !form.host.trim() || tst === 'testing', true))) : null,
-        editMapping ? h(SettingsEditor, { title: tr(editMapping.id ? 'mapping.edit' : 'mapping.add'), close: closeMapping },
+          msg ? h('p', { role: 'status', style: { color: T.ok } }, msg) : null) : null,
+        editMapping ? h(SettingsEditor, {
+          title: tr(editMapping.id ? 'mapping.edit' : 'mapping.add'), close: closeMapping,
+          footer: h(React.Fragment, null,
+            settingsButton(tr('file.cancel'), closeMapping, busy),
+            settingsButton(busy ? tr('settings.saving') : tr('settings.save'), saveMapping,
+              busy || !editMapping.remotePath.trim() || !editMapping.localPath.trim() || !machines.some(machine => machine.id === editMapping.machineId), true)),
+        },
           row(tr('mapping.server'), h('select', { value: editMapping.machineId, onChange: e => changeMapping('machineId', e.target.value), style: inputS },
             h('option', { value: '', disabled: true }, tr('picker.chooseMachine')),
             !machines.some(machine => machine.id === editMapping.machineId) ? h('option', { value: editMapping.machineId, disabled: true }, tr('mapping.missingServer')) : null,
@@ -1369,11 +1408,7 @@ window.__ModuleLoader__.load({
             style: inputS, placeholder: '/home/user/project' }), 'remote'),
           row(tr('mapping.local'), h(LocalMappingDirectory, { value: editMapping.localPath,
             onChange: value => changeMapping('localPath', value), onError: setErr }), 'local'),
-          banner(err),
-          h('div', { style: footerStyle },
-            settingsButton(tr('file.cancel'), closeMapping, busy),
-            settingsButton(busy ? tr('settings.saving') : tr('settings.save'), saveMapping,
-              busy || !editMapping.remotePath.trim() || !editMapping.localPath.trim() || !machines.some(machine => machine.id === editMapping.machineId), true))) : null,
+          banner(err)) : null,
         confirmUi.node)
     }
 

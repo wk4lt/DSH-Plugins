@@ -9,6 +9,51 @@ const mappings = [
 ]
 const response = data => ({ ok: true, status: 200, json: async () => data })
 
+test('manual refresh reports progress, completion, and failure and can be retried', async () => {
+  let gate = null
+  let fail = false
+  let machines = [machine]
+  const ui = mountClient({ fetch: async (url) => {
+    if (gate) await gate
+    if (fail) throw new Error('fixture refresh failed')
+    if (url.endsWith('/machines')) return response({ machines })
+    if (url.endsWith('/mappings')) return response({ mappings: [] })
+    if (url.endsWith('/ssh-config')) return response({ entries: [] })
+    throw new Error('unexpected request: ' + url)
+  } })
+  try {
+    let tree = await ui.settle()
+    let release
+    gate = new Promise(resolve => { release = resolve })
+    const pending = ui.button(tree, /^刷新$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.equal(ui.button(tree, /^刷新中…$/).disabled, true)
+    machines = [{ ...machine, name: '刷新后的开发机' }]
+    gate = null
+    release()
+    await pending
+    tree = await ui.settle()
+    assert.match(ui.text(tree), /已刷新服务器和目录映射/)
+    assert.match(ui.text(tree), /刷新后的开发机/)
+    assert.equal(ui.button(tree, /^刷新$/).disabled, false)
+
+    fail = true
+    await ui.button(tree, /^刷新$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.match(ui.text(tree), /fixture refresh failed/)
+    assert(!ui.text(tree).includes('已刷新服务器和目录映射'))
+    assert.equal(ui.button(tree, /^刷新$/).disabled, false)
+
+    fail = false
+    await ui.button(tree, /^刷新$/).el.props.onClick()
+    tree = await ui.settle()
+    assert(!ui.text(tree).includes('fixture refresh failed'))
+    assert.match(ui.text(tree), /已刷新服务器和目录映射/)
+  } finally {
+    ui.dispose()
+  }
+})
+
 test('settings has only the two requested sections with grouped mappings and editor dialogs', async () => {
   const ui = mountClient({ fetch: async (url) => {
     if (url.endsWith('/machines')) return response({ machines: [machine] })
@@ -32,6 +77,68 @@ test('settings has only the two requested sections with grouped mappings and edi
     const mappingEditor = ui.components(tree).find(node => node.type.name === 'SettingsEditor')
     assert.equal(mappingEditor.props.title, '新增映射')
     assert.equal(ui.elements(mappingEditor.props.children).find(node => node.type === 'select').props.value, 'dev')
+  } finally {
+    ui.dispose()
+  }
+})
+
+test('an empty server list can add its first machine, edit it, and open mapping creation', async () => {
+  let machines = []
+  const saved = []
+  const ui = mountClient({ fetch: async (url, opts) => {
+    if (url.endsWith('/machines') && opts.method === 'POST') {
+      const payload = JSON.parse(opts.body)
+      saved.push(payload)
+      machines = [{ ...payload, id: payload.id || 'new-server', password: undefined, passwordSet: !!payload.password }]
+      return response({ machines, machine: machines[0] })
+    }
+    if (url.endsWith('/machines')) return response({ machines })
+    if (url.endsWith('/mappings')) return response({ mappings: [] })
+    if (url.endsWith('/ssh-config')) return response({ entries: [] })
+    throw new Error('unexpected request: ' + url)
+  } })
+  const editor = tree => ui.components(tree).find(node => node.type.name === 'SettingsEditor')
+  const changeField = (form, label, value) => {
+    const row = ui.elements(form.props.children).find(node => node.type === 'label' && ui.text(node.props.children[0]) === label)
+    assert(row, 'missing field: ' + label)
+    ui.inputs(row)[0].onChange({ target: { value } })
+  }
+  try {
+    let tree = await ui.settle()
+    tree = await ui.click(tree, /^添加新机器$/)
+    let form = editor(tree)
+    assert.equal(form.props.title, '添加新机器')
+    assert.equal(ui.button(form.props.footer, /^保存$/).disabled, true)
+    changeField(form, '名称', '新服务器')
+    changeField(form, '主机', '192.0.2.10')
+    changeField(form, '密码', 'fixture-password')
+    tree = await ui.settle()
+    form = editor(tree)
+    assert.equal(ui.button(form.props.footer, /^保存$/).disabled, false)
+    await ui.button(form.props.footer, /^保存$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.equal(editor(tree), undefined)
+    assert.match(ui.text(tree), /新服务器/)
+    assert.equal(saved[0].action, 'add')
+    assert.equal(saved[0].port, 22)
+    assert.equal(saved[0].username, 'root')
+    assert.equal(saved[0].host, '192.0.2.10')
+
+    tree = await ui.click(tree, /^编辑$/)
+    form = editor(tree)
+    assert.equal(form.props.title, '编辑机器')
+    changeField(form, '名称', '已更新的服务器')
+    tree = await ui.settle()
+    await ui.button(editor(tree).props.footer, /^保存$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.equal(saved[1].action, 'update')
+    assert.equal(saved[1].id, 'new-server')
+    assert.match(ui.text(tree), /已更新的服务器/)
+
+    tree = await ui.click(tree, /^新增映射$/)
+    form = editor(tree)
+    assert.equal(form.props.title, '新增映射')
+    assert.equal(ui.elements(form.props.children).find(node => node.type === 'select').props.value, 'new-server')
   } finally {
     ui.dispose()
   }
