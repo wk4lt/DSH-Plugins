@@ -2,9 +2,65 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { test } from 'node:test'
+import ssh2 from 'ssh2'
 import { createHost, machine } from './harness/plugin-host.js'
 import { startFakeSsh } from './harness/fake-ssh.js'
+import { mountClient } from './harness/render.js'
 import shell from '../lib/remote-shell-child.cjs'
+
+test('the workspace picker lists SSH config aliases and saves only the selected host', { timeout: 5000 }, async t => {
+  const ssh = await startFakeSsh({ fs: { '/projects/app/readme.txt': 'fixture' } })
+  t.after(() => ssh.close())
+  const host = await createHost()
+  t.after(() => host.dispose())
+  const previous = process.env.DSH_REMOTE_SSH_CONFIG
+  const sshConfig = path.join(host.home, 'ssh-config')
+  process.env.DSH_REMOTE_SSH_CONFIG = sshConfig
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_REMOTE_SSH_CONFIG
+    else process.env.DSH_REMOTE_SSH_CONFIG = previous
+  })
+
+  const importHost = { action: 'from-ssh-config', alias: 'vscode-dev' }
+  assert.equal((await host.call('/dsh-remote/machines', { body: importHost })).status, 404)
+  const keyFile = path.join(host.home, 'fixture-key')
+  writeFileSync(keyFile, ssh2.utils.generateKeyPairSync('ed25519').private, { mode: 0o600 })
+  const contents = `Host vscode-dev vscode-other\n  HostName 127.0.0.1\n  User fixture\n  Port ${ssh.port}\n  IdentityFile "${keyFile}"\n`
+  writeFileSync(sshConfig, contents)
+
+  let reportListing
+  const listing = new Promise(resolve => { reportListing = resolve })
+  const ui = mountClient({ fetch: async (url, opts) => {
+    const route = url.split('?')[0]
+    const result = await host.call(route, { method: opts.method, url, body: opts.body ? JSON.parse(opts.body) : {} })
+    if (route === '/dsh-remote/ls') reportListing(result)
+    return { ok: result.status === 200, status: result.status, json: async () => result.json }
+  } })
+  t.after(() => ui.dispose())
+  const picker = ui.component('sidebar.workspaces.directoryFlow')
+  const render = () => ui.settleComponent(picker, { open: true, onPicked() {}, onCancel() {} })
+  const select = tree => ui.elements(tree).find(node => node.type === 'select')
+  const options = tree => ui.elements(select(tree)).filter(node => node.type === 'option').map(node => node.props.value)
+  let tree = await render()
+  ui.button(tree, /^远程$/).el.props.onClick()
+  tree = await render()
+  assert.deepEqual(options(tree), ['', 'ssh:vscode-dev', 'ssh:vscode-other'])
+  assert.deepEqual(host.readMachines(), [])
+
+  await select(tree).props.onChange({ target: { value: 'ssh:vscode-dev' } })
+  tree = await render()
+  const [saved, ...others] = host.readMachines()
+  assert.equal(saved.host, 'vscode-dev')
+  assert.equal(saved.useSshConfig, true)
+  assert.deepEqual(others, [])
+  assert.equal(host.readRegistry().currentId, saved.id)
+  assert.equal(select(tree).props.value, 'machine:' + saved.id)
+  assert.deepEqual(options(tree), ['', 'machine:' + saved.id, 'ssh:vscode-other'])
+  assert.equal(readFileSync(sshConfig, 'utf8'), contents)
+  const listed = await listing
+  assert.equal(listed.status, 200, listed.raw)
+  assert(listed.json.items.some(entry => entry.name === 'projects'))
+})
 
 test('explicit mappings route existing checkouts and preserve the mirror workflow', async () => {
   const ssh = await startFakeSsh({ cwd: '/projects', fs: {

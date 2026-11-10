@@ -272,6 +272,9 @@ window.__ModuleLoader__.load({
         'picker.remoteMachine': '远程机器:',
         'picker.chooseMachine': '— 选择机器 —',
         'picker.noMachines': '还没有机器，请先在设置里添加',
+        'picker.sshConfigMachines': 'SSH 配置中的主机',
+        'picker.machineListFailed': '读取远程机器失败：{msg}',
+        'picker.importMachineFailed': '无法添加 SSH 主机 {alias}',
         'picker.recent': '最近:',
         'picker.pathPlaceholder': '输入远程路径（自动补全）',
         'picker.pathPlaceholderWin': '输入远程路径，如 C:\\Users\\…（自动补全）',
@@ -547,6 +550,9 @@ window.__ModuleLoader__.load({
         'picker.remoteMachine': 'Remote machine:',
         'picker.chooseMachine': '— choose a machine —',
         'picker.noMachines': 'No machines yet — add one in Settings first',
+        'picker.sshConfigMachines': 'Hosts from SSH config',
+        'picker.machineListFailed': 'Could not load remote machines: {msg}',
+        'picker.importMachineFailed': 'Could not add SSH host {alias}',
         'picker.recent': 'Recent:',
         'picker.pathPlaceholder': 'Enter remote path (auto-complete)',
         'picker.pathPlaceholderWin': 'Enter remote path, e.g. C:\\Users\\… (auto-complete)',
@@ -1035,6 +1041,12 @@ window.__ModuleLoader__.load({
     const settingsButton = (label, onClick, disabled = false, primary = false) => h('button', {
       type: 'button', className: 'dsh-rw-btn', style: primary ? primaryBtnS : buttonS, onClick, disabled,
     }, label)
+    const machineAddress = ({ username, host, port }) => [username, host].filter(Boolean).join('@') + (port ? ':' + port : '')
+
+    function unsavedSshHosts(machines, hosts) {
+      const savedAliases = new Set(machines.filter(machine => machine.useSshConfig).map(machine => machine.host))
+      return hosts.filter(host => !savedAliases.has(host.alias))
+    }
 
     function SettingsEditor({ title, close, children, footer }) {
       const backdrop = useBackdropGuard()
@@ -1243,8 +1255,7 @@ window.__ModuleLoader__.load({
       const banner = text => text ? h('p', { role: 'alert', style: { color: T.danger, overflowWrap: 'anywhere' } }, text) : null
       const closeServer = () => { if (!busy && tst !== 'testing') { setForm(null); setErr('') } }
       const closeMapping = () => { if (!busy) { setEditMapping(null); setErr('') } }
-      const savedAliases = new Set(machines.filter(machine => machine.useSshConfig).map(machine => machine.host))
-      const listed = [...machines, ...sshHosts.filter(host => !savedAliases.has(host.alias)).map(host => ({
+      const listed = [...machines, ...unsavedSshHosts(machines, sshHosts).map(host => ({
         name: host.alias, host: host.alias, port: host.port, username: host.user, useSshConfig: true,
       }))]
       const groups = [...machines, ...[...new Set(mappings.map(mapping => mapping.machineId))]
@@ -1252,8 +1263,9 @@ window.__ModuleLoader__.load({
         .map(id => ({ id, name: tr('mapping.missingServer'), missing: true }))]
       const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', padding: '6px 0' }
       const pathStyle = { fontFamily: 'monospace', overflowWrap: 'anywhere', flex: '1 1 240px' }
+      const ellipsisStyle = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
 
-      return h('div', { className: 'dsh-rw-settings', style: { display: 'grid', gap: 12 } },
+      return h('div', { className: 'dsh-rw-settings', style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 12 } },
         !form && !editMapping ? banner(err) : null,
         h('section', { style: boxS, 'aria-label': tr('mapping.servers'), 'aria-busy': refreshing },
           h('div', { style: rowStyle },
@@ -1267,12 +1279,16 @@ window.__ModuleLoader__.load({
           listed.length ? listed.map(machine => {
             const key = machine.id || machine.host
             const result = rowState[key]
-            return h('div', { key, style: { ...rowStyle, borderTop: '1px solid ' + T.border } },
-              h('strong', null, machine.name || machine.host),
-              h('span', { style: pathStyle }, [machine.username, machine.host].filter(Boolean).join('@') + (machine.port ? ':' + machine.port : '')),
-              settingsButton(tr('settings.edit'), () => showServer(machine)),
-              settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), result?.busy),
-              result?.text ? h('span', { role: 'status', style: { flexBasis: '100%', color: result.failed ? T.danger : T.ok } }, result.text) : null)
+            const name = machine.name || machine.host
+            const address = machineAddress(machine)
+            return h('div', { key, style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 8, alignItems: 'center', padding: '6px 0', borderTop: '1px solid ' + T.border } },
+              h('div', { style: { display: 'grid', minWidth: 0, gap: 2 } },
+                h('strong', { title: name, style: ellipsisStyle }, name),
+                h('span', { title: address, style: { ...ellipsisStyle, fontFamily: 'monospace' } }, address)),
+              h('div', { style: { display: 'flex', gap: 8, whiteSpace: 'nowrap' } },
+                settingsButton(tr('settings.edit'), () => showServer(machine)),
+                settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), result?.busy)),
+              result?.text ? h('span', { role: 'status', style: { gridColumn: '1 / -1', overflowWrap: 'anywhere', color: result.failed ? T.danger : T.ok } }, result.text) : null)
           }) : h('p', null, tr('mapping.noServers'))),
         h('section', { style: boxS, 'aria-label': tr('mapping.title') },
           h('h3', { style: { margin: '0 0 8px' } }, tr('mapping.title')),
@@ -1280,7 +1296,7 @@ window.__ModuleLoader__.load({
             const entries = mappings.filter(mapping => mapping.machineId === server.id)
             return h('div', { key: server.id, style: { borderTop: '1px solid ' + T.border, padding: '6px 0' } },
               h('div', { style: rowStyle },
-                h('strong', { style: { flex: 1 } }, (server.name || server.host) + ' · ' + entries.length),
+                h('strong', { style: { flex: 1, overflowWrap: 'anywhere' } }, (server.name || server.host) + ' · ' + entries.length),
                 !server.missing ? settingsButton(tr('mapping.add'), () => showMapping({ machineId: server.id, localPath: '', remotePath: '' })) : null),
               ...entries.map(mapping => h('div', { key: mapping.id, style: { ...rowStyle, paddingLeft: 12 } },
                 h('span', { style: pathStyle }, mapping.localPath + ' ↔ ' + mapping.remotePath),
@@ -1479,7 +1495,9 @@ window.__ModuleLoader__.load({
       const [mappingBusy, setMappingBusy] = React.useState(false)
       const mappingConfirm = useConfirm()
       const [tab, setTab] = React.useState('local')
-      const [machines, setMachines] = React.useState([])
+      const [machineList, setMachineList] = React.useState({ machines: [], sshHosts: [], loading: true, error: '' })
+      const { machines, sshHosts, loading: machinesLoading, error: machinesError } = machineList
+      const [importingMachine, setImportingMachine] = React.useState(false)
       const [machineId, setMachineId] = React.useState('')
       const [path, setPath] = React.useState('')
       const [items, setItems] = React.useState(null)
@@ -1497,6 +1515,8 @@ window.__ModuleLoader__.load({
       const [mkdirPrompt, setMkdirPrompt] = React.useState(false)
       const suggestTimer = React.useRef(null)
       const suggestRef = React.useRef(null)
+      const pickerSessionRef = React.useRef(null)
+      const levelsSeqRef = React.useRef(0)
       // Issue #52 defect 1: the modal backdrop must dismiss only when the press
       // STARTED on it (a suggestion click whose mouseup landed on the backdrop
       // used to close the whole picker). The local-browse popup below is its own
@@ -1526,14 +1546,6 @@ window.__ModuleLoader__.load({
         document.addEventListener('mousedown', onDown)
         return () => document.removeEventListener('mousedown', onDown)
       }, [suggestOpen])
-      const [mOpen, setMOpen] = React.useState(false)
-      const ddRef = React.useRef(null)
-      React.useEffect(() => {
-        if (!mOpen) return
-        const onDown = (ev) => { if (ddRef.current && !ddRef.current.contains(ev.target)) setMOpen(false) }
-        document.addEventListener('mousedown', onDown)
-        return () => document.removeEventListener('mousedown', onDown)
-      }, [mOpen])
       React.useEffect(() => { if (open) ensureChromeCss() }, [open])
 
       const sortItems = (list) => {
@@ -1663,9 +1675,11 @@ window.__ModuleLoader__.load({
 
       const loadLevels = (id, p, toIndex) => {
         if (!id) return
+        const seq = ++levelsSeqRef.current
         setLoading(true); setErr('')
         fetchDirList(id, p || '', true)
         .then((node) => {
+          if (seq !== levelsSeqRef.current) return
           setWin(node.platform)
           const level = { path: node.path, dirs: node.dirs, all: node.all }
           setLevels((prev) => {
@@ -1676,14 +1690,20 @@ window.__ModuleLoader__.load({
             return base.slice(0, idx + 1)
           })
         })
-        .catch((e) => setErr(String((e && e.message) || e)))
-        .finally(() => setLoading(false))
+        .catch((e) => { if (seq === levelsSeqRef.current) setErr(String((e && e.message) || e)) })
+        .finally(() => { if (seq === levelsSeqRef.current) setLoading(false) })
       }
 
-      React.useEffect(() => { if (open) {
+      React.useEffect(() => {
+        if (!open) return
+        const session = { importing: false }
+        pickerSessionRef.current = session
         // Bug fix: the picker must NOT reopen with the previous selection's
         // path — reset the path bar (and the browse state) on every open.
         setPath(''); setLevels(null); setWin(false)
+        setErr(''); setLoading(false); setMachineId(''); setRecent([])
+        setMachineList({ machines: [], sshHosts: [], loading: true, error: '' })
+        setImportingMachine(false)
         setMapLocal(false); setMappedPath('')
         setLocalPop(null); setNewDirName('')
         // Fresh session: re-post /current on the first request and forget
@@ -1692,13 +1712,26 @@ window.__ModuleLoader__.load({
         // listings, plus any pending suggestion response.
         resetPickerFetchState()
         if (suggestTimer.current) { clearTimeout(suggestTimer.current); suggestTimer.current = null }
-        api('GET', '/dsh-remote/machines').then((r) => {
-          setMachines(r.machines || [])
-          const cur = (r.machines || []).find((m) => m.id === r.currentId)
-          setRecent((cur && cur.recentWorkspaces) || [])
-          setMachineId(initialMachineId || r.currentId || (r.machines && r.machines[0] && r.machines[0].id) || '')
+        Promise.allSettled([
+          api('GET', '/dsh-remote/machines'),
+          api('GET', '/dsh-remote/ssh-config'),
+        ]).then(([registry, sshConfig]) => {
+          if (pickerSessionRef.current !== session) return
+          const saved = registry.value?.machines || []
+          const entries = sshConfig.value?.entries || []
+          const error = [registry, sshConfig].filter(result => result.status === 'rejected')
+            .map(result => String(result.reason?.message || result.reason)).join(' / ')
+          const selected = initialMachineId ? saved.find(m => m.id === initialMachineId)
+            : saved.find(m => m.id === registry.value?.currentId) || saved[0]
+          setMachineList({ machines: saved, sshHosts: entries, loading: false, error })
+          setMachineId(selected?.id || '')
+          setRecent(selected?.recentWorkspaces || [])
         })
-      } }, [open])
+        return () => {
+          pickerSessionRef.current = null
+          levelsSeqRef.current++
+        }
+      }, [open])
 
       // 本机目录浏览（browse 后端兜底）：列出 path 的子目录；path 为空 → 宿主家目录。
       const loadLocal = (p) => {
@@ -1742,6 +1775,7 @@ window.__ModuleLoader__.load({
       }
 
       const switchTab = (t) => {
+        if (pickerSessionRef.current?.importing) return
         setTab(t); setErr('')
         // each tab keeps its own path — never leak the other tab's selection
         setPath('')
@@ -1791,6 +1825,43 @@ window.__ModuleLoader__.load({
         suggestSeqRef.current++
         setSuggest([])
         setSuggestOpen(false)
+      }
+
+      const selectMachine = machine => {
+        levelsSeqRef.current++
+        if (suggestTimer.current) { clearTimeout(suggestTimer.current); suggestTimer.current = null }
+        killSuggestions()
+        setMachineId(machine?.id || ''); setRecent(machine?.recentWorkspaces || [])
+        setLevels(null); setPath(''); setWin(false); setPopOpen(false); setErr('')
+        if (machine) loadLevels(machine.id, '', 0)
+        else setLoading(false)
+      }
+
+      const chooseMachine = async value => {
+        const session = pickerSessionRef.current
+        if (!session || session.importing) return
+        const saved = machines.find(machine => value === 'machine:' + machine.id)
+        if (saved) { selectMachine(saved); return }
+        const host = sshHosts.find(entry => value === 'ssh:' + entry.alias)
+        if (!host) return
+        session.importing = true
+        setImportingMachine(true)
+        selectMachine(null)
+        try {
+          // The SSH import activates its machine. Let any earlier switch land first.
+          await currentPromiseRef.current?.promise.catch(() => {})
+          if (pickerSessionRef.current !== session) return
+          const result = await api('POST', '/dsh-remote/machines', { action: 'from-ssh-config', alias: host.alias })
+          if (pickerSessionRef.current !== session) return
+          if (!result.machine?.id) throw new Error(tr('picker.importMachineFailed', { alias: host.alias }))
+          setMachineList(previous => ({ ...previous, machines: result.machines || [...previous.machines, result.machine] }))
+          selectMachine(result.machine)
+        } catch (error) {
+          if (pickerSessionRef.current === session) setErr(error.message)
+        } finally {
+          session.importing = false
+          if (pickerSessionRef.current === session) setImportingMachine(false)
+        }
       }
 
       // One seq-guarded "fetch listing → derive suggestion paths" pipeline
@@ -2056,6 +2127,9 @@ window.__ModuleLoader__.load({
       }, [open, busy, tab, path, machineId, popOpen, suggestOpen, mkdirPrompt, mapLocal, mappedPath, mappingBusy, mappingConfirm.node])
 
       if (!open) return null
+      const configHosts = unsavedSshHosts(machines, sshHosts)
+      const machinePlaceholder = machinesLoading || importingMachine ? tr('picker.loading')
+        : !machines.length && !configHosts.length && !machinesError ? tr('picker.noMachines') : tr('picker.chooseMachine')
       const tabBtn = (t, lbl) => React.createElement('button', {
         type: 'button',
         className: 'dsh-rw-btn dsh-rw-tab' + (tab === t ? ' is-active' : ''),
@@ -2106,21 +2180,20 @@ window.__ModuleLoader__.load({
               localPop ? renderLocalPopup() : null,
             )
           : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, overflowY: suggestOpen ? 'visible' : 'auto' } },
-              React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                React.createElement('label', { style: { fontSize: 12, opacity: 0.8, whiteSpace: 'nowrap' } }, tr('picker.remoteMachine')),
-                React.createElement('div', { ref: ddRef, style: { position: 'relative', display: 'inline-block' } },
-                  React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...inputS, textAlign: 'left', cursor: 'pointer', minWidth: 200, maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, onClick: () => setMOpen((x) => !x) },
-                    (machines.find((m) => m.id === machineId) || {}).name || (machineId ? '…' : tr('picker.chooseMachine')),
-                  ),
-                  mOpen
-                    ? React.createElement('div', { style: { position: 'absolute', top: '100%', left: 0, zIndex: 1000, marginTop: 2, minWidth: 300, maxHeight: 260, overflow: 'auto', background: v('--dsw-alias-bg-overlay', '#1f1f23'), color: T.label, border: '1px solid ' + T.border, borderRadius: T.radius, padding: 4 } },
-                        machines.length
-                          ? machines.map((m) => React.createElement('div', { key: m.id, className: 'dsh-rw-list-item', onClick: () => { setMachineId(m.id); setRecent(m.recentWorkspaces || []); setLevels(null); setPath(''); setMOpen(false); if (m.id) loadLevels(m.id, '', 0) }, style: { padding: '6px 8px', borderRadius: 4, cursor: 'pointer', color: m.id === machineId ? T.ok : 'inherit' } }, m.name + '  (' + m.username + '@' + m.host + ':' + m.port + ')'))
-                          : React.createElement('div', { style: { padding: 6, opacity: 0.6 } }, tr('picker.noMachines')),
-                      )
-                    : null,
-                ),
+              h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                h('span', { style: { fontSize: 12, opacity: 0.8, whiteSpace: 'nowrap' } }, tr('picker.remoteMachine')),
+                h('select', { className: 'dsh-rw-input', 'aria-label': tr('picker.remoteMachine'),
+                  style: { ...inputS, minWidth: 0, maxWidth: 320, textOverflow: 'ellipsis' },
+                  value: machineId ? 'machine:' + machineId : '', disabled: machinesLoading || importingMachine || busy || mappingBusy,
+                  onChange: e => chooseMachine(e.target.value),
+                }, h('option', { value: '', disabled: true }, machinePlaceholder),
+                ...machines.map(machine => h('option', { key: machine.id, value: 'machine:' + machine.id },
+                  `${machine.name || machine.host} (${machineAddress(machine)})`)),
+                configHosts.length ? h('optgroup', { label: tr('picker.sshConfigMachines') },
+                  ...configHosts.map(host => h('option', { key: host.alias, value: 'ssh:' + host.alias },
+                    `${host.alias} (${machineAddress({ username: host.user, host: host.hostName || host.alias, port: host.port })})`))) : null),
               ),
+              machinesError ? h('div', { role: 'alert', style: { color: T.danger, fontSize: 12 } }, tr('picker.machineListFailed', { msg: machinesError })) : null,
               recent.length ? React.createElement('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
                 React.createElement('span', { style: { fontSize: 11, opacity: 0.6, whiteSpace: 'nowrap' } }, tr('picker.recent')),
                 recent.map((w, i) => React.createElement('button', { type: 'button', className: 'dsh-rw-btn', key: w + i, onClick: () => { setPath(w); setErr(''); continueSuggest(w) }, style: { ...buttonS, padding: '2px 8px', fontSize: 11, fontFamily: 'monospace' } }, w))) : null,

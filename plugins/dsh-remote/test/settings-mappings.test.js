@@ -150,6 +150,7 @@ test('remote picker opens the chosen local checkout when mapping is enabled', as
   const ui = mountClient({ fetch: async (url, opts) => {
     const route = url.split('?')[0]
     if (route.endsWith('/machines')) return response({ machines: [machine], currentId: 'dev' })
+    if (route.endsWith('/ssh-config')) return response({ entries: [] })
     if (route.endsWith('/current')) return response({ ok: true })
     if (route.endsWith('/ls')) return response({ path: '/', items: [], platform: 'posix' })
     if (route.endsWith('/mappings')) {
