@@ -1491,7 +1491,7 @@ export async function apply(ctx, config) {
   /**
    * HTTP binding for sidebar file routes. A sessionId/local hint is authoritative:
    * a local (non-mirror) session is refused rather than falling back to the
-   * active machine. Requests with no hint keep the picker/settings active pool.
+   * active machine. The workspace picker can name a saved machine explicitly.
    */
   const resolveRequestBinding = async (req, body = {}) => {
     const hint = requestSessionHint(req, body)
@@ -1520,6 +1520,13 @@ export async function apply(ctx, config) {
       )
       err.httpStatus = 403
       throw err
+    }
+    const machineId = String(body?.machineId || '').trim()
+    if (machineId && !hint.sessionId) {
+      const record = machines[machineIndex(machineId)]
+      if (!record) throw codedError('MACHINE_NOT_FOUND', 'machine not found: ' + machineId, { httpStatus: 404 })
+      const target = { ...identityOf(record), alias: aliasOf(record), machineId }
+      return { ...target, pool: poolForMachine(target), ws: record.workspace || '', bound: false, local: false }
     }
     // No session context: fall back to the ACTIVE machine. Boot restore runs on
     // `setImmediate`, so a request that arrives first would see `config.host`

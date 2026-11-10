@@ -8,6 +8,53 @@ import { startFakeSsh } from './harness/fake-ssh.js'
 import { mountClient } from './harness/render.js'
 import shell from '../lib/remote-shell-child.cjs'
 
+test('picker mkdir creates one directory on the selected server and reports SFTP failures', { timeout: 15000 }, async t => {
+  const selected = await startFakeSsh({ fs: { '/projects/readme': 'selected', '/C:/readme': 'drive root' } })
+  t.after(() => selected.close())
+  const other = await startFakeSsh({ fs: { '/projects/readme': 'other' } })
+  t.after(() => other.close())
+  const host = await createHost({
+    machines: [
+      machine(selected.machine({ id: 'selected' })),
+      machine(other.machine({ id: 'other' })),
+    ],
+    currentId: 'other',
+  })
+  t.after(() => host.dispose())
+
+  const mkdir = (name, overrides = {}) => host.call('/dsh-remote/fs', {
+    body: { op: 'mkdir', machineId: 'selected', path: '/projects', name, ...overrides },
+  })
+  const list = path => host.call('/dsh-remote/ls?' + new URLSearchParams({ machineId: 'selected', path }), { method: 'GET' })
+  const name = '进度 100%'
+  const created = await mkdir(name)
+  assert.equal(created.status, 200, created.raw)
+  assert.equal(selected.fs.get('/projects/' + name)?.type, 'dir')
+  assert.equal(other.fs.has('/projects/' + name), false)
+  assert.equal(host.readRegistry().currentId, 'other')
+  const parent = await list('/projects')
+  assert.equal(parent.json.machine.id, 'selected')
+  assert(parent.json.items.some(item => item.name === name && item.type === 'dir'))
+  const child = await list('/projects/' + name)
+  assert.equal(child.status, 200, child.raw)
+  assert.equal(child.json.path, '/projects/' + name)
+  assert.equal(child.json.missing, false)
+
+  assert.equal((await mkdir(name)).status, 409)
+  assert.equal((await mkdir('nested/child')).status, 400)
+  assert.equal((await mkdir('child', { path: '' })).status, 400)
+  assert.equal((await mkdir('child', { machineId: 'missing' })).status, 404)
+  assert.equal((await mkdir('windows-child', { path: 'C:\\' })).status, 200)
+  assert.equal(selected.fs.get('/C:/windows-child')?.type, 'dir')
+
+  selected.fs.mkdir = () => { throw new Error('fixture rejected mkdir') }
+  const denied = await mkdir('denied')
+  assert.equal(denied.status, 500, denied.raw)
+  assert.equal(denied.json.ok, false)
+  assert.match(denied.json.error, /Failure/)
+  assert.equal(selected.fs.has('/projects/denied'), false)
+})
+
 test('the workspace picker lists SSH config aliases and saves only the selected host', { timeout: 5000 }, async t => {
   const ssh = await startFakeSsh({ fs: { '/projects/app/readme.txt': 'fixture' } })
   t.after(() => ssh.close())

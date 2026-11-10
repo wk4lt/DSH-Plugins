@@ -1,7 +1,7 @@
 // Sidebar file routes: /ls /read /write /fs.
 //
-// Machine-scoped callers (workspace picker, settings) omit sessionId and use
-// the active-machine pool. Session-scoped callers (explorer / file tab) MUST
+// The workspace picker supplies machineId to bind to the selected machine.
+// Session-scoped callers (explorer / file tab) MUST
 // pass sessionId (or local=mirror cwd); those requests resolve through the
 // same mirror binding as rw_* tools and never fall back to the active machine.
 import { mkdirSync } from 'node:fs'
@@ -9,7 +9,6 @@ import path from 'node:path'
 import {
   normalizeRemotePath, joinRemotePath, remoteDirname, mkdirRemoteDirs, toDisplayPath,
 } from './paths.js'
-import { requestSessionHint } from './binding.js'
 import { listDirStructured, listRemoteDrives, removeRemoteTree, previewRemoteFile } from './remote-fs.js'
 
 export function createFsRoutes({
@@ -47,8 +46,8 @@ export function createFsRoutes({
           if (req.method === 'POST') {
             try { body = JSON.parse((await readBody(req)) || '{}') } catch { body = {} }
           }
-          const hint = requestSessionHint(req, body)
-          const b = await bindOrReply(req, res, hint)
+          const q = new URL(req.url, 'http://localhost').searchParams
+          const b = await bindOrReply(req, res, { ...body, machineId: q.get('machineId') || body?.machineId })
           if (!b) return
           // Identity echo (external-switch defense): name the machine this
           // listing is answered for, straight from the pool's target — the
@@ -57,15 +56,13 @@ export function createFsRoutes({
           // machine under a memoized picker).
           const tgt = (b.pool && b.pool.config) || {}
           const machine = {
+            ...(b.machineId ? { id: b.machineId } : {}),
             host: String(tgt.host || b.host || ''),
             port: Number(tgt.port) || Number(b.port) || 22,
             username: String(tgt.username || b.username || ''),
           }
           await b.pool.detect()
-          const q = new URL(req.url, 'http://localhost').searchParams
-          const raw = q.get('path')
-            ? decodeURIComponent(q.get('path'))
-            : (body.path ? String(body.path) : (b.ws || ''))
+          const raw = q.get('path') || (body?.path ? String(body.path) : (b.ws || ''))
           const canon = normalizeRemotePath(raw)
           const win = b.pool.platform === 'windows'
           if (canon === '/' || raw === '' || raw === '/') {
@@ -175,14 +172,35 @@ export function createFsRoutes({
           const op = String(body.op || '')
           const b = await bindOrReply(req, res, body)
           if (!b) return
-          const sftp = await b.pool.sftp()
           if (op === 'mkdir') {
-            const p = normalizeRemotePath(String(body.path || ''))
-            if (!p || p === '/') return sendJson(res, 400, { ok: false, error: 'path required' })
-            await mkdirRemoteDirs(sftp, p)
-            audit('mkdir', `mkdir ${p}`, 0, b)
+            const base = String(body.path || '')
+            let target = normalizeRemotePath(base)
+            if (body.name !== undefined) {
+              const name = typeof body.name === 'string' ? body.name.trim() : ''
+              if (!name || name === '.' || name === '..' || /[\\/\0]/.test(name)) {
+                return sendJson(res, 400, { ok: false, error: '请输入单个目录名，不能包含路径分隔符' })
+              }
+              if (!/^(?:\/|[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(base)) {
+                return sendJson(res, 400, { ok: false, error: '请先进入要创建子目录的远程目录' })
+              }
+              target = joinRemotePath(target, name)
+              const sftp = await b.pool.sftp()
+              try {
+                await sftp.mkdir(target)
+              } catch (err) {
+                if (await sftp.lstat(target).catch(() => null)) {
+                  return sendJson(res, 409, { ok: false, error: '同名文件或目录已存在' })
+                }
+                throw err
+              }
+            } else {
+              if (target === '/') return sendJson(res, 400, { ok: false, error: 'path required' })
+              await mkdirRemoteDirs(await b.pool.sftp(), target)
+            }
+            audit('mkdir', `mkdir ${target}`, 0, b)
             return sendJson(res, 200, { ok: true })
           }
+          const sftp = await b.pool.sftp()
           if (op === 'rename') {
             const p = normalizeRemotePath(String(body.path || ''))
             const d = normalizeRemotePath(String(body.dest || ''))

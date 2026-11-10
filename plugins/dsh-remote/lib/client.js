@@ -309,6 +309,9 @@ window.__ModuleLoader__.load({
         'picker.typePath': ' — 可直接在输入框填本地路径',
         'picker.noHome': '无法解析主目录',
         'picker.newDirName': '新建目录名（在 {path} 下）',
+        'picker.invalidDirName': '请输入单个目录名，不能包含路径分隔符',
+        'picker.mkdirParentRequired': '请先进入要创建子目录的远程目录',
+        'picker.mkdirAlreadyExists': '同名文件或目录已存在',
         'picker.noSubdir': '（没有子目录 — 可直接选用当前目录）',
         'picker.truncated': '（条目过多已截断）',
         'picker.thisPc': '此电脑',
@@ -587,6 +590,9 @@ window.__ModuleLoader__.load({
         'picker.typePath': ' — type a local path in the input box instead',
         'picker.noHome': 'Cannot resolve home directory',
         'picker.newDirName': 'New directory name (under {path})',
+        'picker.invalidDirName': 'Enter a single directory name without path separators',
+        'picker.mkdirParentRequired': 'Open a remote directory before creating a subdirectory',
+        'picker.mkdirAlreadyExists': 'A file or directory with that name already exists',
         'picker.noSubdir': ' (no subdirectories — you can use the current directory)',
         'picker.truncated': ' (too many entries, truncated)',
         'picker.thisPc': 'This PC',
@@ -705,6 +711,9 @@ window.__ModuleLoader__.load({
       '目录选择已超时，请重试或直接在输入框填本地路径': 'picker.timeout',
       '无法打开系统文件夹选择器': 'picker.noSysPicker',
       '当前系统不支持自动打开目录选择器，请在输入框直接填本地路径': 'picker.noSysPickerHost',
+      '请输入单个目录名，不能包含路径分隔符': 'picker.invalidDirName',
+      '请先进入要创建子目录的远程目录': 'picker.mkdirParentRequired',
+      '同名文件或目录已存在': 'picker.mkdirAlreadyExists',
       'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径': 'picker.noHomeWin',
       '无法连接 npm registry': 'settings.registryUnreachable',
     }
@@ -882,29 +891,20 @@ window.__ModuleLoader__.load({
     }
 
     function PromptDialog(props) {
-      const { title, initial, placeholder, onSubmit, onCancel } = props
+      const { title, initial, placeholder, onSubmit, onCancel, abovePicker, pending, error } = props
       const backdrop = useBackdropGuard()
+      const panelRef = React.useRef(null)
       const [val, setVal] = React.useState(initial || '')
-      const submit = () => { const t = val.trim(); if (t) onSubmit(t) }
-      React.useEffect(() => {
-        try {
-          if (typeof document === 'undefined') return
-          const onKey = (e) => {
-            if (e.key === 'Escape') { e.preventDefault(); onCancel() }
-            if (e.key === 'Enter') { e.preventDefault(); submit() }
-          }
-          document.addEventListener('keydown', onKey)
-          return () => document.removeEventListener('keydown', onKey)
-        } catch { return undefined }
-      }, [val, onSubmit, onCancel])
-      // Host Modal when available: portal + focus trap + autofocus + restore +
-      // IME-composition guard come from its useModalLayer; our document-level
-      // Escape/Enter stays as the fallback path's key handling (harmless
-      // duplication: Modal's layer preventDefaults first).
-      if (Modal) {
+      const submit = () => { const t = val.trim(); if (t && !pending) onSubmit(t) }
+      const close = () => { if (!pending) onCancel() }
+      const useHostModal = Modal && !abovePicker
+      if (useModalLayerFn) useModalLayerFn(panelRef, !useHostModal, close)
+      // The host's Modal portal sits below the directory picker's overlay.
+      // Use our own portal above it for the nested directory-name prompt.
+      if (useHostModal) {
         return React.createElement(Modal, {
           open: true,
-          onClose: onCancel,
+          onClose: close,
           title,
           closeLabel: tr('picker.close'),
           onKeyDownCapture: (e) => {
@@ -918,26 +918,34 @@ window.__ModuleLoader__.load({
           ),
         )
       }
-      return React.createElement('div', {
+      const overlay = React.createElement('div', {
         style: { position: 'fixed', inset: 0, zIndex: 1000000, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 },
         onMouseDown: backdrop.onMouseDown,
         // Issue #52: only a press that STARTED here may dismiss (a gesture that
         // began inside the panel and ended on the backdrop must not).
-        onClick: (e) => { if (backdrop.onClick(e)) onCancel() },
+        onClick: (e) => { if (backdrop.onClick(e)) close() },
       },
         React.createElement('div', {
+          ref: panelRef, role: 'dialog', 'aria-modal': true, 'aria-label': title, tabIndex: -1,
           className: 'dsh-rw-modal-panel',
           style: { background: v('--dsw-alias-bg-overlay', '#1e1e1e'), border: '1px solid ' + T.borderStrong, borderRadius: 10, padding: 14, width: 'min(420px, 92vw)', display: 'flex', flexDirection: 'column', gap: 10, boxShadow: '0 12px 40px rgba(0,0,0,0.4)' },
           onClick: (e) => e.stopPropagation(),
+          onKeyDown: (e) => {
+            if (e.nativeEvent?.isComposing) return
+            if (e.key === 'Escape') { e.preventDefault(); close() }
+            if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); submit() }
+          },
         },
           React.createElement('div', { style: { fontSize: 13, fontWeight: 600, color: T.label } }, title),
-          React.createElement('input', { autoFocus: true, value: val, onChange: (e) => setVal(e.target.value), placeholder: placeholder || '', className: 'dsh-rw-input', style: inputS }),
+          React.createElement('input', { autoFocus: true, 'data-modal-autofocus': true, value: val, onChange: (e) => setVal(e.target.value), placeholder: placeholder || '', className: 'dsh-rw-input', style: inputS, disabled: pending }),
+          error ? React.createElement('div', { role: 'alert', style: { color: T.danger, overflowWrap: 'anywhere' } }, error) : null,
           React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
-            React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: buttonS, onClick: onCancel }, tr('file.cancel')),
-            React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => { const t = val.trim(); if (t) onSubmit(t) }, disabled: !val.trim() }, tr('common.confirm')),
+            React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: buttonS, onClick: close, disabled: pending }, tr('file.cancel')),
+            React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: submit, disabled: pending || !val.trim() }, pending ? tr('picker.loading') : tr('common.confirm')),
           ),
         ),
       )
+      return abovePicker ? portalize(overlay) : overlay
     }
 
     /**
@@ -1573,6 +1581,7 @@ window.__ModuleLoader__.load({
       // machine may show up as its ~/.ssh/config alias OR its resolved host, so
       // accept either identity; nothing to compare against → accept.
       const echoMatches = (id, echo) => {
+        if (echo?.id) return echo.id === id
         if (!echo || !echo.host) return true // older host half without an echo
         const m = (machines || []).find((x) => x && x.id === id)
         if (!m) return true
@@ -1626,7 +1635,7 @@ window.__ModuleLoader__.load({
         const gen = ++fetchSeqRef.current
         lsGenRef.current.set(key, gen)
         const toNode = (res) => {
-          const real = res && res.path ? res.path : String(dirParam)
+          const real = typeof res?.path === 'string' ? res.path : String(dirParam)
           // Server returns [{ type, name, size, mtime, path }] where `path` is
           // the FULL display-form path (C:\Users\dev on Windows) — the client
           // never joins paths itself, so drives and Windows paths just work.
@@ -1641,7 +1650,7 @@ window.__ModuleLoader__.load({
           }
         }
         const run = (retried) => ensureCurrent(id)
-        .then(() => api('GET', '/dsh-remote/ls?path=' + encodeURIComponent(dirParam)))
+        .then(() => api('GET', '/dsh-remote/ls?' + new URLSearchParams({ path: dirParam, machineId: id })))
         .then((res) => {
           // External-switch defense: on an identity-echo mismatch the host is
           // no longer on the machine this fetch intended — bust the memo, force
@@ -1705,7 +1714,7 @@ window.__ModuleLoader__.load({
         setMachineList({ machines: [], sshHosts: [], loading: true, error: '' })
         setImportingMachine(false)
         setMapLocal(false); setMappedPath('')
-        setLocalPop(null); setNewDirName('')
+        setLocalPop(null); setNewDirName(''); setMkdirPrompt(false); setPopOpen(false)
         // Fresh session: re-post /current on the first request and forget
         // everything a previous open left behind (TTL bounds staleness within
         // one open; reopening should see the live tree) — cached AND in-flight
@@ -1976,21 +1985,27 @@ window.__ModuleLoader__.load({
       }
 
       const mkdirHere = () => {
-        const last = levels && levels.length ? levels[levels.length - 1] : null
-        const base = (last && last.path) || '/'
-        setMkdirPrompt({ base })
+        const levelIndex = (levels?.length || 0) - 1
+        const base = levels?.[levelIndex]?.path
+        if (!machineId || !base || loading) return
+        setMkdirPrompt({ base, levelIndex, machineId })
       }
-      const confirmMkdirHere = (nm) => {
-        const last = levels && levels.length ? levels[levels.length - 1] : null
-        const base = (mkdirPrompt && mkdirPrompt.base) || (last && last.path) || '/'
-        setMkdirPrompt(false)
-        const name = String(nm || '').trim()
-        if (!name) return
-        const sep = base.includes('\\') ? '\\' : '/'
-        const full = base === '/' ? '/' + name : base + sep + name
-        api('POST', '/dsh-remote/fs', { op: 'mkdir', path: full })
-          .then(() => { setErr(''); loadLevels(machineId, base, (levels ? levels.length - 1 : 0)) })
-          .catch((e) => setErr(String((e && e.message) || e)))
+      const confirmMkdirHere = async (name) => {
+        const session = pickerSessionRef.current
+        if (!mkdirPrompt || !session || session.creatingDirectory) return
+        const { base, levelIndex, machineId } = mkdirPrompt
+        session.creatingDirectory = true
+        setMkdirPrompt({ ...mkdirPrompt, pending: true, error: '' })
+        try {
+          await api('POST', '/dsh-remote/fs', { op: 'mkdir', path: base, name, machineId })
+          if (pickerSessionRef.current !== session) return
+          setMkdirPrompt(false)
+          loadLevels(machineId, base, levelIndex)
+        } catch (error) {
+          if (pickerSessionRef.current === session) setMkdirPrompt({ ...mkdirPrompt, pending: false, error: error.message })
+        } finally {
+          session.creatingDirectory = false
+        }
       }
 
       // 本机浏览浮层的面包屑：browse 后端给出完整祖先链（含盘符根），可点击跳转。
@@ -2078,7 +2093,7 @@ window.__ModuleLoader__.load({
           React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', padding: '6px 10px', borderBottom: '1px solid ' + T.border } },
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: goUp, disabled: loading || (levels.length <= 1 && !parentOf(last.path)) }, tr('picker.back')),
             React.createElement('div', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, breadcrumb(!!machineId, last.path, win, (p) => setLevels((prev) => { const cut = (prev || []).findIndex((lv) => lv.path === p); return cut >= 0 ? prev.slice(0, cut + 1) : prev }))),
-            React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: mkdirHere }, tr('picker.newDir')),
+            React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: mkdirHere, disabled: loading || !last.path || !machineId }, tr('picker.newDir')),
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: () => setPopOpen(false) }, tr('picker.closeBtn')),
           ),
           React.createElement('div', { style: { overflowY: 'auto', overflowX: 'hidden' } },
@@ -2255,8 +2270,9 @@ window.__ModuleLoader__.load({
         (tab === 'local') ? React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } }, React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: buttonS, onClick: onCancel }, tr('picker.cancel'))) : null,
         mappingConfirm.node,
         mkdirPrompt ? React.createElement(PromptDialog, {
-          title: tr('picker.newDirName', { path: mkdirPrompt.base || '/' }),
+          title: tr('picker.newDirName', { path: mkdirPrompt.base }),
           placeholder: tr('explorer.namePlaceholder'),
+          abovePicker: true, pending: mkdirPrompt.pending, error: mkdirPrompt.error,
           onSubmit: confirmMkdirHere,
           onCancel: () => setMkdirPrompt(false),
         }) : null,
