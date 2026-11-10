@@ -17,7 +17,6 @@
 const { spawn } = require('node:child_process')
 const { existsSync, fstatSync, readFileSync } = require('node:fs')
 const path = require('node:path')
-const { mappingForLocal } = require('./directory-mappings.cjs')
 
 /** Name of the marker the host half writes into every local mirror root. */
 const META_FILE = '.dsh-remote-meta.json'
@@ -112,15 +111,14 @@ function remoteCd(remotePath) {
 /**
  * The remote command: land in the workspace, then hand over to a login shell.
  *
- * `exec` keeps the pty attached to a single interactive shell, so the exit code
- * the terminal sees is the shell's own, and a deleted workspace falls back to
- * `$HOME` instead of leaving a broken terminal.
+ * `exec` keeps the pty attached to a single interactive shell. If the root
+ * disappeared, `cd` reports the error and the terminal exits.
  *
  * @param {string} remotePath
  * @returns {string}
  */
 function remoteCommand(remotePath) {
-  return `${remoteCd(remotePath)} 2>/dev/null || cd "$HOME"; exec "\${SHELL:-/bin/bash}" -l`
+  return `${remoteCd(remotePath)} && exec "\${SHELL:-/bin/bash}" -l`
 }
 
 /** Absolute Windows path: `D:\x`, `D:/x`, or a `\\server\share` UNC path.
@@ -157,13 +155,12 @@ function isWindowsRemotePath(p) {
  * @returns {string[]}
  */
 function buildSshArgs(target, machine) {
-  const args = ['-tt']
+  const args = ['-tt', '-o', 'HostName=' + target.host, '-p', String(target.port || 22)]
   const alias = target.alias || (machine && machine.useSshConfig ? machine.host : '')
   if (alias) {
+    if (target.username) args.push('-l', target.username)
     args.push(String(alias))
   } else {
-    const port = Number(target.port || (machine && machine.port) || 22)
-    if (port !== 22) args.push('-p', String(port))
     const key = machine && machine.privateKeyPath
     if (key && !machine.useAgent) args.push('-i', String(key))
     const user = target.username || (machine && machine.username) || ''
@@ -229,25 +226,34 @@ function parseArgs(argv) {
  */
 function resolveTarget(input = {}) {
   const cwd = input.cwd || process.cwd()
-  const registry = input.machines ? (input.readJsonFile || readJson)(input.machines) : undefined
-  const mapping = input.machines && mappingForLocal(path.dirname(input.machines), cwd)
-  if (mapping) {
-    const machine = registry?.list?.find(entry => entry.id === mapping.machineId)
-    if (!machine) return { found: false }
-    return { found: true, dir: mapping.localPath, machine, target: {
-      host: machine.host, port: machine.port || 22, username: machine.username || '',
-      alias: machine.useSshConfig ? machine.host : '', remotePath: mapping.remotePath,
-    } }
+  const root = input.machines && path.dirname(input.machines)
+  let mirror
+  if (root) {
+    const relative = path.relative(root, cwd)
+    if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return { found: false }
+    const [hostDir, workspaceDir] = relative.split(path.sep)
+    if (workspaceDir) {
+      const dir = path.join(root, hostDir, workspaceDir)
+      const meta = (input.readJsonFile || readJson)(path.join(dir, META_FILE))
+      if (meta?.host) mirror = { dir, meta }
+    }
+  } else {
+    mirror = findMirror(cwd, input)
   }
-  const mirror = findMirror(cwd, input)
-  if (!mirror) return { found: false }
-  const machine = matchMachine(mirror.meta, registry)
+  const registry = input.machines ? (input.readJsonFile || readJson)(input.machines) : undefined
+  if (!mirror || !mirror.meta.remotePath) {
+    return root ? { found: true, error: 'The remote workspace binding is missing or invalid.' } : { found: false }
+  }
+  const machine = mirror.meta.machineId
+    ? registry?.list?.find(entry => entry.id === mirror.meta.machineId)
+    : matchMachine(mirror.meta, registry)
+  if (mirror.meta.machineId && !machine) return { found: true, error: 'The saved SSH server is unavailable.' }
   const target = {
     host: mirror.meta.host,
     port: mirror.meta.port || (machine && machine.port) || 22,
     username: mirror.meta.username || (machine && machine.username) || '',
     alias: mirror.meta.alias || '',
-    remotePath: mirror.meta.remotePath || (machine && machine.workspace) || '',
+    remotePath: mirror.meta.remotePath,
   }
   return { found: true, target, machine, dir: mirror.dir }
 }
@@ -302,7 +308,7 @@ function handover(file, args) {
  *           stdin?: object, fstat?: (fd: number) => any,
  *           write?: (line: string) => void, exit?: (code: number) => any }} [deps]
  */
-function main(argv = process.argv.slice(2), deps = {}) {
+async function main(argv = process.argv.slice(2), deps = {}) {
   const platform = deps.platform || process.platform
   const env = deps.env || process.env
   const write = deps.write || ((line) => process.stderr.write(line))
@@ -319,10 +325,25 @@ function main(argv = process.argv.slice(2), deps = {}) {
   }
   const options = parseArgs(argv)
   const resolved = resolveTarget({ cwd: deps.cwd || process.cwd(), machines: options.machines })
+  if (resolved.error) {
+    write('[dsh-remote] ' + resolved.error + '\n')
+    return exit(1)
+  }
   if (!resolved.found) {
     process.stderr.write('[dsh-remote] this directory is not a remote workspace; opening a local shell.\n')
     process.stderr.write('[dsh-remote] 当前目录不是远程工作区，已打开本地终端。\n')
     return handover(localShell(platform, env), platform === 'win32' ? [] : ['-l'])
+  }
+  if (resolved.machine) {
+    const { resolveLiteralSshConfig, resolveMachineSshConfig } = await import('./sshconfig.js')
+    const machine = resolved.machine
+    const current = (machine.useSshConfig ? resolveMachineSshConfig(machine) : resolveLiteralSshConfig(machine)) || machine
+    const { host, port, username } = resolved.target
+    if ((current.host || machine.host) !== host || (Number(current.port || machine.port) || 22) !== Number(port)
+      || (current.username || machine.username || '') !== username) {
+      write('[dsh-remote] The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.\n')
+      return exit(1)
+    }
   }
   const ssh = sshBinary(platform, env)
   const args = buildSshArgs(resolved.target, resolved.machine)
@@ -351,4 +372,7 @@ module.exports = {
   stdinIsInteractive,
 }
 
-if (require.main === module) main()
+if (require.main === module) main().catch(error => {
+  process.stderr.write('[dsh-remote] ' + error.message + '\n')
+  process.exitCode = 1
+})

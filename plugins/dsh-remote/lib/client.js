@@ -330,6 +330,11 @@ window.__ModuleLoader__.load({
         // issue #49：会话列表里标识「这是远程会话，连的是哪台机」
         'session.remoteBadge': '远程会话：{target}',
         'session.remoteHover': '远程主机：{target}',
+        'session.workspace': '远程工作区',
+        'session.remotePath': '远程工作目录',
+        'session.localPath': '本地目录',
+        'session.pull': '拉取到本地',
+        'session.push': '推送到远端',
         'explorer.loading': '加载中…',
         'explorer.dirMissing': '目录不存在或已被删除',
         'explorer.notConnected': '未连接远程主机（重启后需在设置中将机器「设为当前」，或刷新右侧列）',
@@ -611,6 +616,11 @@ window.__ModuleLoader__.load({
         // issue #49: tell a remote Session apart in the Session list, and name its host.
         'session.remoteBadge': 'Remote session: {target}',
         'session.remoteHover': 'Remote host: {target}',
+        'session.workspace': 'Remote workspace',
+        'session.remotePath': 'Remote working directory',
+        'session.localPath': 'Local directory',
+        'session.pull': 'Pull to local',
+        'session.push': 'Push to remote',
         'explorer.loading': 'Loading…',
         'explorer.dirMissing': 'Directory does not exist or was deleted',
         'explorer.notConnected': 'Not connected to the remote host (after a restart, set a machine as "current" in Settings, or refresh the right column)',
@@ -1550,7 +1560,7 @@ window.__ModuleLoader__.load({
       const suggestSeqRef = React.useRef(0)
       React.useEffect(() => {
         if (!suggestOpen) return
-        const onDown = (ev) => { if (suggestRef.current && !suggestRef.current.contains(ev.target)) { suggestSeqRef.current++; setSuggestOpen(false) } }
+        const onDown = (ev) => { if (suggestRef.current && !suggestRef.current.contains(ev.target)) killSuggestions() }
         document.addEventListener('mousedown', onDown)
         return () => document.removeEventListener('mousedown', onDown)
       }, [suggestOpen])
@@ -1720,7 +1730,7 @@ window.__ModuleLoader__.load({
         // one open; reopening should see the live tree) — cached AND in-flight
         // listings, plus any pending suggestion response.
         resetPickerFetchState()
-        if (suggestTimer.current) { clearTimeout(suggestTimer.current); suggestTimer.current = null }
+        killSuggestions()
         Promise.allSettled([
           api('GET', '/dsh-remote/machines'),
           api('GET', '/dsh-remote/ssh-config'),
@@ -1739,6 +1749,7 @@ window.__ModuleLoader__.load({
         return () => {
           pickerSessionRef.current = null
           levelsSeqRef.current++
+          cancelSuggestionRequest()
         }
       }, [open])
 
@@ -1785,6 +1796,8 @@ window.__ModuleLoader__.load({
 
       const switchTab = (t) => {
         if (pickerSessionRef.current?.importing) return
+        killSuggestions()
+        closeBrowser()
         setTab(t); setErr('')
         // each tab keeps its own path — never leak the other tab's selection
         setPath('')
@@ -1829,16 +1842,36 @@ window.__ModuleLoader__.load({
         if (par) loadLevels(machineId, par, 1)
       }
 
-      // Drop any pending suggestion response and close the dropdown.
-      const killSuggestions = () => {
+      const cancelSuggestionRequest = () => {
+        clearTimeout(suggestTimer.current)
+        suggestTimer.current = null
         suggestSeqRef.current++
+      }
+
+      // Cancel a queued lookup and ignore any response already in flight.
+      const killSuggestions = () => {
+        cancelSuggestionRequest()
         setSuggest([])
         setSuggestOpen(false)
       }
 
+      const closeBrowser = () => {
+        if (!popOpen) return
+        levelsSeqRef.current++
+        setLoading(false)
+        setPopOpen(false)
+      }
+
+      const openBrowser = () => {
+        if (!machineId) return
+        killSuggestions()
+        setLevels(null)
+        setPopOpen(true)
+        loadLevels(machineId, path.trim(), 0)
+      }
+
       const selectMachine = machine => {
         levelsSeqRef.current++
-        if (suggestTimer.current) { clearTimeout(suggestTimer.current); suggestTimer.current = null }
         killSuggestions()
         setMachineId(machine?.id || ''); setRecent(machine?.recentWorkspaces || [])
         setLevels(null); setPath(''); setWin(false); setPopOpen(false); setErr('')
@@ -1912,14 +1945,16 @@ window.__ModuleLoader__.load({
       }
 
       const onPathChange = (raw) => {
+        closeBrowser()
+        killSuggestions()
         setPath(raw); setErr('')
-        if (suggestTimer.current) clearTimeout(suggestTimer.current)
         suggestTimer.current = setTimeout(() => loadSuggestions(raw), 220)
       }
 
       const continueSuggest = (dir) => {
-        if (!machineId || !dir) { killSuggestions(); return }
-        setSuggestOpen(false)
+        closeBrowser()
+        killSuggestions()
+        if (!machineId || !dir) return
         const target = String(dir).replace(/[\\/]+$/, '') || '/'
         // Expanding a just-selected directory is a NAVIGATION step: the caching
         // spec only sanctions "typing inside one parent directory, local
@@ -1939,49 +1974,50 @@ window.__ModuleLoader__.load({
 
       const commitPath = (p) => {
         const target = String(p || '').trim()
-        if (!target || !machineId || busy) return
+        if (!target || !machineId || busy || mappingBusy || (mapLocal && !mappedPath.trim())) return
+        const openWorkspace = async mapping => {
+          const res = await api('POST', '/dsh-remote/mirror', {
+            path: target, machineId, registerWorkspace: registerWorkspace !== false,
+            ...(mapping ? { mappingId: mapping.id, mappingRevision: mapping.revision } : {}),
+          })
+          if (!res.localMirror) throw new Error(res.error || tr('picker.chooseMachineFirst'))
+          await refreshMirrors()
+          onPicked(res.localMirror, res.path || target)
+        }
+        setMappingBusy(true); setErr('')
+        closeBrowser()
+        killSuggestions()
         if (mapLocal) {
-          if (!mappedPath.trim() || mappingBusy) return
-          setMappingBusy(true); setErr('')
           saveDirectoryMapping({ machineId, remotePath: target, localPath: mappedPath }, mappingConfirm.ask, machines)
-            .then(mapping => { if (mapping) onPicked(mapping.localPath, mapping.remotePath) })
+            .then(mapping => { if (mapping) return openWorkspace(mapping) })
             .catch(error => setErr(error.message))
             .finally(() => setMappingBusy(false))
           return
         }
-        setPopOpen(false); killSuggestions()
-        // State the machine this pick was made on. The picker acts on the shared
-        // active pool, and another actor (the settings page, or rw_connect in
-        // another session) can switch it while the picker is open — the mirror
-        // would then be created with THAT machine's identity while the user was
-        // looking at this one's tree. The host re-asserts the named machine
-        // instead of trusting whichever happens to be active.
-        ensureCurrent(machineId)
-          .then(() => api('POST', '/dsh-remote/mirror', { path: target, machineId, registerWorkspace: registerWorkspace !== false }))
-          // `onPicked(localMirror, remotePath)`: the mirror is ALREADY created here.
-          // The sidebar opens the local mirror (1st arg); a caller that only wants to
-          // report/continue from the remote path uses the 2nd. Handing back only the
-          // local path made the settings page post /mirror a SECOND time with a
-          // Windows path as if it were remote ("not a directory (or unreachable)").
-          .then((res) => (res && res.localMirror ? onPicked(res.localMirror, res.path || target) : setErr((res && res.error) || '')))
+        openWorkspace()
           .catch((e) => setErr(String((e && e.message) || e)))
+          .finally(() => setMappingBusy(false))
       }
 
       const acceptBrowserPick = (p) => {
         setPath(String(p || ''))
         killSuggestions()
-        setPopOpen(false)
+        closeBrowser()
       }
 
       const pickHome = () => {
         // Same identity contract as commitPath: /home is answered by the active
         // pool, so name the machine this picker is showing.
+        closeBrowser()
+        killSuggestions()
+        const seq = suggestSeqRef.current
         ensureCurrent(machineId)
           .then(() => api('POST', '/dsh-remote/home', { machineId }))
           .then((r) => {
+            if (seq !== suggestSeqRef.current) return
             if (r && r.home) { setPath(r.home); setErr(''); loadSuggestions(r.home) }
             else setErr((r && (r.hint || r.error)) || tr('picker.noHome'))
-          }).catch((e) => setErr(String((e && e.message) || e)))
+          }).catch((e) => { if (seq === suggestSeqRef.current) setErr(String((e && e.message) || e)) })
       }
 
       const mkdirHere = () => {
@@ -2094,7 +2130,7 @@ window.__ModuleLoader__.load({
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: goUp, disabled: loading || (levels.length <= 1 && !parentOf(last.path)) }, tr('picker.back')),
             React.createElement('div', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, breadcrumb(!!machineId, last.path, win, (p) => setLevels((prev) => { const cut = (prev || []).findIndex((lv) => lv.path === p); return cut >= 0 ? prev.slice(0, cut + 1) : prev }))),
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: mkdirHere, disabled: loading || !last.path || !machineId }, tr('picker.newDir')),
-            React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: () => setPopOpen(false) }, tr('picker.closeBtn')),
+            React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: closeBrowser }, tr('picker.closeBtn')),
           ),
           React.createElement('div', { style: { overflowY: 'auto', overflowX: 'hidden' } },
             loading ? React.createElement('div', { style: { opacity: 0.7, padding: 12 } }, tr('picker.loading'))
@@ -2113,7 +2149,7 @@ window.__ModuleLoader__.load({
           ),
           React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', padding: '6px 10px', borderTop: '1px solid ' + T.border } },
             React.createElement('span', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, tr('picker.selected', { path: (last.path || (win ? tr('picker.driveRoot') : '/')) })),
-            React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => { acceptBrowserPick(last.path); setPopOpen(false) } }, tr('picker.chooseThis')),
+            React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => acceptBrowserPick(last.path), disabled: loading }, tr('picker.chooseThis')),
           ),
         )
       }
@@ -2125,15 +2161,15 @@ window.__ModuleLoader__.load({
           const onKey = (e) => {
             if (mkdirPrompt || mappingConfirm.node) return
             if (e.key === 'Escape') {
-              if (popOpen) { e.preventDefault(); setPopOpen(false); return }
-              if (suggestOpen) { e.preventDefault(); suggestSeqRef.current++; setSuggestOpen(false); return }
+              if (popOpen) { e.preventDefault(); closeBrowser(); return }
+              if (suggestOpen) { e.preventDefault(); killSuggestions(); return }
               if (!busy && !mappingBusy) { e.preventDefault(); onCancel() }
               return
             }
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
               e.preventDefault()
               if (tab === 'local' && path.trim()) onPicked(path)
-              else if (tab === 'remote' && path.trim()) commitPath(path)
+              else if (tab === 'remote' && !popOpen && path.trim()) commitPath(path)
             }
           }
           document.addEventListener('keydown', onKey)
@@ -2218,10 +2254,11 @@ window.__ModuleLoader__.load({
                     className: 'dsh-rw-input',
                     value: path,
                     onChange: (e) => onPathChange(e.target.value),
-                    onFocus: () => loadSuggestions(path),
+                    onFocus: () => { if (!popOpen) loadSuggestions(path) },
                     onKeyDown: (e) => {
-                      if (e.key === 'Enter') {
+                      if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey) {
                         e.preventDefault()
+                        if (popOpen) return
                         if (suggestOpen && suggest.length) selectSuggestion(suggest[0])
                         else if (path.trim()) commitPath(path)
                       }
@@ -2229,10 +2266,10 @@ window.__ModuleLoader__.load({
                     placeholder: (machineId ? (win ? tr('picker.pathPlaceholderWin') : tr('picker.pathPlaceholder')) : tr('picker.chooseMachineFirst')),
                     disabled: !machineId, style: { ...inputS, flex: 1, minWidth: 120 },
                   }),
-                  React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: () => { if (!machineId) return; const p = path.trim(); loadLevels(machineId, p || '', 0); setPopOpen(true) }, disabled: !machineId }, tr('picker.browse')),
+                  React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: openBrowser, disabled: !machineId }, tr('picker.browse')),
                   React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: pickHome, disabled: !machineId }, tr('picker.home')),
                 ),
-                (suggestOpen && suggest.length)
+                (!popOpen && suggestOpen && suggest.length)
                   // Issue #52 defect 2: this used to be an in-flow block, so
                   // expanding it pushed the 「设为远程工作区」 button down and the
                   // user could never hit a button that was moving. It is now an
@@ -2508,9 +2545,24 @@ window.__ModuleLoader__.load({
     // nothing from the sidebar.
     function RemoteSessionChip(props) {
       const m = useSessionMirror(props.sessionId, props.useSessions)
+      const [open, setOpen] = React.useState(false)
+      const [pending, setPending] = React.useState(false)
+      const [message, setMessage] = React.useState(null)
       if (!m) return null
       const target = mirrorTarget(m)
-      return React.createElement('span', {
+      const sync = async direction => {
+        setPending(true); setMessage(null)
+        try {
+          const result = await api('POST', '/dsh-remote/sync-workspace', { sessionId: props.sessionId, direction })
+          setMessage({ text: result.text })
+        } catch (error) {
+          setMessage({ text: error.message, failed: true })
+        } finally {
+          setPending(false)
+        }
+      }
+      return h(React.Fragment, null, h('button', {
+        type: 'button', onClick: () => { setMessage(null); setOpen(true) },
         'data-dsh-remote-chip': '',
         className: 'dsh-rw-pill is-ok',
         title: tr('session.remoteHover', { target }) + (m.remotePath ? '\n' + m.remotePath : ''),
@@ -2521,7 +2573,18 @@ window.__ModuleLoader__.load({
           style: { width: 7, height: 7, borderRadius: '50%', flexShrink: 0, background: 'var(--dsw-alias-state-success-primary, #4caf7d)' },
         }),
         React.createElement('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, target),
-      )
+      ), open ? h(SettingsEditor, {
+        title: tr('session.workspace'),
+        close: () => { if (!pending) setOpen(false) },
+        footer: h(React.Fragment, null,
+          settingsButton(tr('session.pull'), () => sync('pull'), pending),
+          settingsButton(tr('session.push'), () => sync('push'), pending)),
+      },
+        h('p', { style: { overflowWrap: 'anywhere' } }, tr('session.remotePath'), ' ', h('code', null, target, ' ', m.remotePath)),
+        h('p', { style: { overflowWrap: 'anywhere' } }, tr('session.localPath'), ' ', h('code', null, m.localPath || m.dir)),
+        pending ? h('p', { role: 'status' }, tr('picker.loading')) : null,
+        message ? h('pre', { role: message.failed ? 'alert' : 'status', style: { whiteSpace: 'pre-wrap' } }, message.text) : null,
+      ) : null)
     }
 
     function readRemoteFile(path, maxBytes, sessionId) {

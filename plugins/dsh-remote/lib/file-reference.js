@@ -62,7 +62,7 @@ export const DEFAULT_MAX_DIRS = 300
 export const DEFAULT_TIMEOUT_MS = 4000
 /** How long a built index is considered fresh. */
 export const DEFAULT_CACHE_TTL_MS = 10000
-/** Cooldown after a failed remote listing, during which local results are used. */
+/** Cooldown after a failed remote listing, to avoid repeated SSH timeouts. */
 export const DEFAULT_FAILURE_COOLDOWN_MS = 30000
 
 /**
@@ -384,10 +384,7 @@ export function createRemoteFileReference({ listDir, config = {}, onError, now }
  * remote host.
  *
  * The seam is a single-owner service, so this is an overlay rather than a
- * second provider: `resolve(agent)` returns a remote provider for an agent whose
- * workspace is a dsh-remote mirror, and `null` for every other agent (including
- * a remote agent whose host is currently unavailable) — in which case the
- * original implementation answers with the local view.
+ * second provider. The original implementation supplies results for local sessions.
  *
  * @param {object} ctx - plugin context.
  * @param {object} opts
@@ -403,42 +400,21 @@ export function installFileReferenceOverlay(ctx, { resolve, onError } = {}) {
     const service = inner.fileReferences
     if (!service || typeof service.list !== 'function') return
     const original = service.list
-    const patched = function (agent, query, signal) {
-      let remote = null
+    const patched = async function (agent, query, signal) {
+      const remote = resolve(agent)
+      if (!remote) return original.call(service, agent, query, signal)
+      const unavailable = () => new Error('Could not list files on the bound SSH workspace.')
+      if (typeof remote.ready === 'function' && !remote.ready()) throw unavailable()
       try {
-        remote = resolve(agent)
-      } catch (err) {
-        report(err)
-        remote = null
-      }
-      // Fall back to the local provider whenever this agent is not a remote
-      // session, the feature is off, or the host is cooling down after a
-      // failure: showing the synced mirror beats showing nothing.
-      if (!remote || (typeof remote.ready === 'function' && !remote.ready())) {
-        return original.call(service, agent, query, signal)
-      }
-      const fallback = () => original.call(service, agent, query, signal)
-      try {
-        return Promise.resolve(remote.list(String(query ?? ''), signal)).then(
-          (candidates) => {
-            if (candidates === null) {
-              remote.markDown?.()
-              return fallback()
-            }
-            return candidates
-          },
-          (err) => {
-            // An aborted keystroke is not a host failure: don't open the breaker.
-            if (signal && signal.aborted) throw err
-            report(err)
-            remote.markDown?.()
-            return fallback()
-          },
-        )
-      } catch (err) {
-        report(err)
-        remote.markDown?.()
-        return fallback()
+        const candidates = await remote.list(String(query ?? ''), signal)
+        if (candidates === null) throw unavailable()
+        return candidates
+      } catch (error) {
+        if (!signal?.aborted) {
+          report(error)
+          remote.markDown?.()
+        }
+        throw error
       }
     }
     service.list = patched

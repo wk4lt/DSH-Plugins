@@ -415,7 +415,7 @@ export function createHostApi(deps = {}) {
     } catch (err) {
       throw asApiError(err)
     }
-    const extra = machine.alias ? { alias: machine.alias } : {}
+    const extra = { alias: machine.alias, machineId: machine.machineId }
     let localMirror
     try {
       localMirror = await need('ensureMirror')(remotePath, machine.host, machine.username, machine.port, extra)

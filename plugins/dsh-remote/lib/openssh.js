@@ -197,7 +197,8 @@ export function sshBinaryAvailable(binary) {
  */
 export function baseSshArgs(config, { forSecret = false } = {}) {
   const args = []
-  if (config.port && Number(config.port) !== 22) args.push('-p', String(Number(config.port)))
+  if (config.pinnedHost) args.push('-o', 'HostName=' + config.pinnedHost)
+  if (config.port && (config.pinnedHost || Number(config.port) !== 22)) args.push('-p', String(Number(config.port)))
   if (config.username) args.push('-l', String(config.username))
   if (config.privateKeyPath) args.push('-i', String(config.privateKeyPath))
   // An explicit jump host — the same shape the native backend's `proxy` takes.

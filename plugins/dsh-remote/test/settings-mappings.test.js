@@ -144,7 +144,7 @@ test('an empty server list can add its first machine, edit it, and open mapping 
   }
 })
 
-test('remote picker opens the chosen local checkout when mapping is enabled', async () => {
+test('remote picker opens a remote workspace anchor for the chosen checkout', async () => {
   const requests = []
   const picked = []
   const ui = mountClient({ fetch: async (url, opts) => {
@@ -156,6 +156,10 @@ test('remote picker opens the chosen local checkout when mapping is enabled', as
     if (route.endsWith('/mappings')) {
       requests.push(JSON.parse(opts.body))
       return response({ ok: true, mapping: mappings[0] })
+    }
+    if (route.endsWith('/mirror')) {
+      requests.push(JSON.parse(opts.body))
+      return response({ ok: true, path: mappings[0].remotePath, localMirror: 'D:\\dsh\\remote-workspaces\\dev\\api-mapped' })
     }
     throw new Error('unexpected request: ' + url)
   } })
@@ -178,8 +182,78 @@ test('remote picker opens the chosen local checkout when mapping is enabled', as
     tree = await render()
     ui.button(tree, /^设为远程工作区$/).el.props.onClick()
     await ui.tick()
-    assert.deepEqual(requests, [{ machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' }])
-    assert.deepEqual(picked, [[mappings[0].localPath, mappings[0].remotePath]])
+    assert.deepEqual(requests, [
+      { machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' },
+      { machineId: 'dev', path: mappings[0].remotePath, mappingId: 'a', mappingRevision: '1', registerWorkspace: true },
+    ])
+    assert.deepEqual(picked, [['D:\\dsh\\remote-workspaces\\dev\\api-mapped', mappings[0].remotePath]])
+  } finally {
+    ui.dispose()
+  }
+})
+
+test('opening the remote directory browser dismisses autocomplete and drops late results', async () => {
+  const listings = []
+  const directory = (base, name) => response({
+    path: base, items: [{ type: 'dir', name, path: base + '/' + name }], platform: 'posix',
+  })
+  let finishSlowListing
+  const slowListing = new Promise(resolve => { finishSlowListing = resolve })
+  const ui = mountClient({ fetch: async url => {
+    const request = new URL(url, 'http://localhost')
+    if (request.pathname.endsWith('/machines')) return response({ machines: [machine], currentId: 'dev' })
+    if (request.pathname.endsWith('/ssh-config')) return response({ entries: [] })
+    if (request.pathname.endsWith('/current')) return response({ ok: true })
+    if (request.pathname.endsWith('/ls')) {
+      const path = request.searchParams.get('path')
+      listings.push(path)
+      if (path === '/slow') return slowListing
+      if (path.startsWith('/slow')) return directory('/slow', 'late')
+      if (path.startsWith('/projects')) return directory('/projects', 'alpha')
+      return response({ path: '/', items: [], platform: 'posix' })
+    }
+    throw new Error('unexpected request: ' + url)
+  } })
+  try {
+    const picker = ui.component('sidebar.workspaces.directoryFlow')
+    const props = { open: true, onPicked() {}, onCancel() {} }
+    const render = () => ui.settleComponent(picker, props)
+    const input = tree => ui.inputs(tree).find(field => field.placeholder?.includes('远程路径'))
+    const browse = tree => ui.button(tree, /^浏览…$/).el.props.onClick()
+    const type = (tree, value) => input(tree).onChange({ target: { value } })
+    let tree = await render()
+    ui.button(tree, /^远程$/).el.props.onClick()
+    tree = await render()
+
+    type(tree, '/projects/')
+    ui.timers.flush(220)
+    await ui.tick()
+    tree = await render()
+    assert.match(ui.text(tree), /\/projects\/alpha/)
+    browse(tree)
+    await ui.tick()
+    tree = await render()
+    assert.doesNotMatch(ui.text(tree), /\/projects\/alpha/)
+    assert.equal(ui.button(tree, /^选用此路径$/).disabled, false)
+
+    type(tree, '/queued/')
+    browse(await render())
+    ui.timers.flush(220)
+    await ui.tick()
+    assert(!listings.includes('/queued'))
+
+    type(await render(), '/slow/')
+    ui.timers.flush(220)
+    await ui.tick()
+    assert(listings.includes('/slow'))
+    browse(await render())
+    await ui.tick()
+    finishSlowListing(directory('/slow', 'late'))
+    await ui.tick()
+    tree = await render()
+    assert.doesNotMatch(ui.text(tree), /\/slow\/late/)
+    ui.button(tree, /^选用此路径$/).el.props.onClick()
+    assert.equal(input(await render()).value, '/slow')
   } finally {
     ui.dispose()
   }
