@@ -12,7 +12,9 @@ import { mountClient } from './harness/render.js'
 import shell from '../lib/remote-shell-child.cjs'
 
 test('picker mkdir creates one directory on the selected server and reports SFTP failures', { timeout: 15000 }, async t => {
-  const selected = await startFakeSsh({ fs: { '/projects/readme': 'selected', '/C:/readme': 'drive root' } })
+  const selected = await startFakeSsh({ cwd: '/home/fixture user', fs: {
+    '/home/fixture user/project/readme': 'home', '/projects/readme': 'selected', '/C:/readme': 'drive root',
+  } })
   t.after(() => selected.close())
   const other = await startFakeSsh({ fs: { '/projects/readme': 'other' } })
   t.after(() => other.close())
@@ -29,6 +31,12 @@ test('picker mkdir creates one directory on the selected server and reports SFTP
     body: { op: 'mkdir', machineId: 'selected', path: '/projects', name, ...overrides },
   })
   const list = path => host.call('/dsh-remote/ls?' + new URLSearchParams({ machineId: 'selected', path }), { method: 'GET' })
+  const home = await host.call('/dsh-remote/home', { body: { machineId: 'selected' } })
+  assert.equal(home.status, 200, home.raw)
+  assert.equal(home.json.home, '/home/fixture user')
+  assert((await list(home.json.home)).json.items.some(item => item.name === 'project'))
+  assert.equal((await host.call('/dsh-remote/home', { body: { machineId: 'missing' } })).status, 404)
+  assert.equal(host.readRegistry().currentId, 'other')
   const name = '进度 100%'
   const created = await mkdir(name)
   assert.equal(created.status, 200, created.raw)

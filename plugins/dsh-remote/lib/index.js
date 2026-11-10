@@ -841,34 +841,6 @@ export async function apply(ctx, config) {
     return created
   }
 
-  /**
-   * Re-assert the ACTIVE machine that a machine-scoped request names.
-   *
-   * The workspace picker (and the settings page's workspace flow) acts on the
-   * shared active pool, but it remembers its own `machineId` locally. Nothing
-   * on `/mirror` / `/home` / `/fs` used to carry that identity, so a switch
-   * performed by ANOTHER actor between the picker's last fetch and its commit —
-   * the settings page's "set as current", or an `rw_connect` in another agent
-   * session — silently redirected the commit onto that other machine. Before
-   * this PR the picker re-posted /current on every keystroke, which masked the
-   * window; the per-keystroke reconnect fix removes that accident. Let the
-   * request state its intent so the host can honour it atomically instead.
-   *
-   * An absent / empty `machineId` keeps the old behaviour (the caller is
-   * machine-scoped through the active pool by design). An UNKNOWN id is
-   * refused rather than ignored: quietly mirroring onto whichever machine
-   * happens to be active is exactly the hazard this closes.
-   *
-   * @returns {Promise<boolean>} false when the request was already answered.
-   */
-  const applyRequestedMachine = async (body, res) => {
-    const id = String((body && body.machineId) || '').trim()
-    if (!id) return true
-    if (await setCurrent(id)) return true
-    sendJson(res, 404, { ok: false, error: `machine not found: ${id}` })
-    return false
-  }
-
   const setCurrent = async (id) => {
     if (!id) {
       // Explicit "active remote = none": saved machines stay in the registry
@@ -4349,25 +4321,17 @@ export async function apply(ctx, config) {
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' })
         try {
           const body = parseJsonObject(await readBody(req))
-          // The picker names the machine it is showing: re-assert it before
-          // answering, so a switch made elsewhere cannot make /home describe a
-          // different host than the tree the user is looking at.
-          if (!(await applyRequestedMachine(body, res))) return
-          const out = await pool.exec('echo ~', { timeoutMs: Math.min(config.commandTimeoutMs, 5000) })
-          const home = String(out.stdout || '').replace(/\s+/g, '').trim()
-          if (!home) return sendJson(res, 200, { ok: true, home: null, hint: 'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径' })
+          const binding = await resolveRequestBinding(req, body)
+          // A fresh SFTP channel starts in the account's home directory as
+          // exposed by the server, including on SFTP-only connections.
+          const sftp = await binding.pool.sftp()
+          const home = await sftp.realpath('.')
+          if (!/^(?:\/|[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/.test(home || '')) {
+            return sendJson(res, 502, { ok: false, error: '无法获取远端 SSH 用户的主目录' })
+          }
           return sendJson(res, 200, { ok: true, home })
         } catch (err) {
-          // `ok:false` — reporting `ok:true` WITH an `error` is a contradiction:
-          // any caller that trusts `ok` treats "could not resolve the home
-          // directory" as success. The picker only reads `home`, so it still falls
-          // back to `hint`/`error` exactly as before.
-          return sendJson(res, 200, {
-            ok: false,
-            home: null,
-            hint: 'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径',
-            error: String((err && err.message) || err),
-          })
+          return sendJson(res, err.httpStatus || 502, { ok: false, error: String(err.message || err) })
         }
       },
     },
