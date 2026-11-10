@@ -3,8 +3,7 @@
 // Host half. Turns "give me a remote host + login" into a usable REMOTE WORKSPACE:
 //   • one persistent SSH/SFTP pool per configured remote (password OR private key,
 //     SSH agent, keyboard-interactive, proxy jump),
-//   • a "current remote workspace" — a remote directory the agent treats as the
-//     active project root (user@host:/path) — injected into every system prompt,
+//   • a session-bound SSH project root (user@host:/path) in the runtime context,
 //   • model tools `rw_*` (info/connect/workspace/list/read/write/edit/append/mkdir/
 //     remove/move/stat/exec/search/download/upload/sync/push/forward/disconnect),
 //   • JSON endpoints the client settings page + sidebar use over the harness
@@ -21,7 +20,7 @@
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, statSync, renameSync, copyFileSync, appendFileSync, watch } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync, renameSync, copyFileSync, appendFileSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -37,7 +36,7 @@ import { friendlyMessage } from './errors.js'
 import { listAliases, sshConfigPath, readSshConfigText, resolveMachineSshConfig, resolveLiteralSshConfig, readRawSshConfig, upsertManagedHostBlock, removeManagedHostBlock, writeSshConfig } from './sshconfig.js'
 import { createRemoteFileReference, installFileReferenceOverlay, DEFAULT_EXCLUDED_DIRECTORIES } from './file-reference.js'
 import { getSecret, deleteSecret, platformBackend, persistPassword } from './credential.js'
-import { syncTree, pushTree, loadSyncState, saveSyncState, pushOneFile } from './sync.js'
+import { syncTree, pushTree, loadSyncState, saveSyncState } from './sync.js'
 import { createInstructionIndex, formatInstructionIndex } from './instructions.js'
 import { resolveExecTimeout, formatExecResult, startExecJob, execWithOptionalPromotion } from './exec-job.js'
 import { createInjectionTracker, refreshTouched, buildInstructionMessage, pickUserMessageFactory, loadBundledUserMessageFactory } from './instructions-dynamic.js'
@@ -46,7 +45,7 @@ import { createTerminalManager } from './terminal.js'
 import { createTerminalRoutes } from './routes-term.js'
 import { searchRemote } from './search.js'
 import { installTerminalShell } from './remote-shell.js'
-import { resolveMirror, poolKey, lookupSessionCwd, encodeSegmentSafe, readSessionHeaderCwd, requestSessionHint } from './binding.js'
+import { resolveMirror, poolKey, lookupSessionCwd, requestSessionHint } from './binding.js'
 import { TaskManager } from './tasks.js'
 import { ForwardManager } from './forwards.js'
 import { formatAuditLine, readAuditLines } from './audit.js'
@@ -58,8 +57,9 @@ import { SshPool, ActivePool, createPool } from './pool.js'
 import { isSystemOpenSshBackend, sshBinaryAvailable, resolveSshBinary } from './openssh.js'
 import { createFsRoutes } from './routes-fs.js'
 import { listDirStructured, removeRemoteTree } from './remote-fs.js'
+import { installWorkspaceToolRouting } from './workspace-tools.js'
 import { readMappings, localDirectory, saveMapping, removeMapping, mappingForLocal } from './directory-mappings.cjs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 export const name = 'wk4lt-dsh-remote'
 
@@ -107,17 +107,6 @@ export const LOCAL_BOOTSTRAP_TOOLS = ['rw_machines', 'rw_connect', 'rw_pick_work
 export function normalizeLocalTools(value) {
   const v = String(value || '').trim().toLowerCase()
   return v === 'none' || v === 'all' ? v : 'bootstrap'
-}
-
-/** rw_pick_workspace's closing "what next" sentence (issue #63). In a LOCAL
- *  session `rw_sync` cannot run — the mirror path must be opened as a NEW
- *  session first, because tool routing keys on the session's cwd and picking
- *  a workspace does not change it. Only a mirror-bound (or caller-context-
- *  less) session can sync right away. */
-export function pickWorkspaceNextStep(localSession) {
-  return localSession
-    ? 'NOTE: this session is LOCAL — rw_sync and the other remote tools refuse to run here. Open a session whose workspace IS the local mirror path above, then run rw_sync there to download the remote files.'
-    : 'Run rw_sync to download its files into the local mirror.'
 }
 
 // Web and Desktop share the SSH tools; each optional UI transport is attached
@@ -183,7 +172,7 @@ export const Config = z.object({
     password: z.string().default(''),
     privateKeyPath: z.string().default(''),
   }),
-  /** Auto-push edited mirror files back to the remote (watcher, debounced). Default off. */
+  /** Legacy configuration key. Use explicit workspace synchronization. */
   autoPush: z.boolean().default(false),
   /** Append executed commands to the audit log under the harness home. */
   auditLog: z.boolean().default(true),
@@ -327,16 +316,40 @@ function mirrorDirFor(remotePath, host, user, port) {
   return path.join(root, base + '-' + shortHash(norm))
 }
 
-/** Create the local mirror dir + a meta file describing its remote origin.
- *  `extra.alias` records the ~/.ssh/config alias a machine was saved as (issue
- *  #38), so the mirror keeps resolving to its machine even if the alias's
- *  HostName/user/port change in that file afterwards. */
+/** Create the local workspace anchor and record its original SSH target. */
 function ensureMirror(remotePath, host, user, port, extra = {}) {
-  const dir = mirrorDirFor(remotePath, host, user, port)
-  mkdirSync(dir, { recursive: true })
+  let dir = extra.mapping
+    ? path.join(mirrorRootFor(host, user, port), remotePathBase(remotePath) + '-mapped-' + shortHash(extra.mapping.revision))
+    : mirrorDirFor(remotePath, host, user, port)
   const meta = { host, port, username: user, remotePath: normalizeRemotePath(remotePath), createdAt: new Date().toISOString() }
   if (extra.alias) meta.alias = String(extra.alias)
-  writeFileSync(path.join(dir, '.dsh-remote-meta.json'), JSON.stringify(meta, null, 2))
+  if (extra.machineId) meta.machineId = extra.machineId
+  if (extra.mapping) meta.mapping = extra.mapping
+  const markerPath = () => path.join(dir, '.dsh-remote-meta.json')
+  const matches = marker => {
+    let saved
+    try { saved = JSON.parse(readFileSync(marker, 'utf8')) } catch { return false }
+    return saved && saved.host === host && Number(saved.port || 22) === Number(port || 22)
+      && (saved.username || '') === (user || '') && saved.remotePath === meta.remotePath
+      && (saved.machineId || '') === (meta.machineId || '') && (saved.alias || '') === (meta.alias || '')
+      && (saved.mapping?.revision || '') === (meta.mapping?.revision || '')
+  }
+  if (existsSync(markerPath()) && !matches(markerPath())) {
+    const identity = [host, port, user, meta.remotePath, meta.machineId, meta.alias, meta.mapping?.revision]
+    dir += '-ssh-' + createHash('sha256').update(JSON.stringify(identity)).digest('hex').slice(0, 16)
+  }
+  const marker = markerPath()
+  if (existsSync(marker) && !matches(marker)) throw new Error('The remote workspace binding is invalid. Choose a different workspace.')
+  if (!existsSync(marker)) {
+    mkdirSync(dir, { recursive: true })
+    const temporary = marker + '.' + randomUUID()
+    try {
+      writeFileSync(temporary, JSON.stringify(meta, null, 2), { mode: 0o600, flag: 'wx' })
+      renameSync(temporary, marker)
+    } finally {
+      rmSync(temporary, { force: true })
+    }
+  }
   return dir
 }
 
@@ -570,7 +583,10 @@ export async function apply(ctx, config) {
   const isMachineLive = (m) => {
     if (!m || !m.host) return false
     try {
-      if (machinePools.get('mapping:' + m.id)?.client || machinePools.get(poolKey(identityOf(m)))?.client) return true
+      const identity = poolKey(identityOf(m))
+      if (machinePools.get('workspace:' + m.id + ':' + identity)?.client
+        || machinePools.get('workspace::' + identity)?.client
+        || machinePools.get('mapping:' + m.id)?.client || machinePools.get(identity)?.client) return true
     } catch { /* identity resolution is best-effort: a broken alias must not throw */ }
     return !!(store.currentId && m.id === store.currentId && pool.client)
   }
@@ -743,20 +759,22 @@ export async function apply(ctx, config) {
    * @returns {SshPool} the pool pinned to that identity; never the active-machine pool.
    */
   const poolForMachine = (target) => {
-    const key = target.machineId ? 'mapping:' + target.machineId : poolKey(target)
-    // `rec` is the registry record (raw); `eff` is its CONNECT identity, with an
-    // ssh-config alias resolved (issue #38). For an alias whose HostName/USER/port
-    // changed since the mirror was created, the RESOLVED identity wins over the
-    // mirror-recorded one — that is what makes an edit to ~/.ssh/config take
-    // effect for an existing session instead of dialing the stale address.
+    const key = target.pinned
+      ? 'workspace:' + (target.machineId || '') + ':' + poolKey(target)
+      : target.machineId ? 'mapping:' + target.machineId : poolKey(target)
+    // Credentials can be refreshed, but a session cannot change SSH identity.
     const rec = machineRecordFor(target)
+    if (target.pinned && ((target.machineId && rec?.id !== target.machineId) || (rec && !identityMatches(rec, target)))) {
+      throw codedError('REMOTE_BINDING_CHANGED', 'The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.', { httpStatus: 409 })
+    }
     const eff = rec ? withSshConfig(rec) : null
     // Issue #51: on the system-OpenSSH backend an alias machine connects AS its
     // alias so ~/.ssh/config (not the registry) supplies host/user/port/key.
     const t = connectTargetFor(eff || target)
     const host = t.aliasNative ? t.host : ((eff && eff.host) || target.host)
-    const port = t.aliasNative ? 0 : (Number((eff && eff.port) || target.port) || 22)
-    const username = t.aliasNative ? '' : ((eff && eff.username) || target.username || 'root')
+    const port = t.aliasNative && !target.pinned ? 0 : (Number((eff && eff.port) || target.port) || 22)
+    const username = t.aliasNative && !target.pinned ? '' : ((eff && eff.username) || target.username || 'root')
+    const pinnedHost = target.pinned ? target.host : ''
     const existing = machinePools.get(key)
     if (existing) {
       syncTunables(existing.config)
@@ -767,6 +785,7 @@ export async function apply(ctx, config) {
       // its delegate class from `config.backend` during setTarget/_sync, so
       // assigning it afterwards would hand the OLD backend the new target.
       if (eff) {
+        existing.config.pinnedHost = pinnedHost
         existing.config.password = eff.password || ''
         existing.config.privateKeyPath = t.aliasNative ? '' : (eff.privateKeyPath || '')
         existing.config.passphrase = eff.passphrase || ''
@@ -791,6 +810,7 @@ export async function apply(ctx, config) {
       host,
       port,
       username,
+      pinnedHost,
       password: (eff && eff.password) || '',
       privateKeyPath: t.aliasNative ? '' : ((eff && eff.privateKeyPath) || ''),
       passphrase: (eff && eff.passphrase) || '',
@@ -889,15 +909,7 @@ export async function apply(ctx, config) {
     config.workspace = ''
     pool.setTarget({ host: '', port: 22, username: '', workspace: '' }, previous)
     // Also stop any auto-push watcher bound to the old machine workspace.
-    // (autoPushWatchers is declared later; read it lazily to avoid TDZ.)
-    if (typeof autoPushWatchers !== 'undefined' && autoPushWatchers) {
-      for (const [, entry] of autoPushWatchers) {
-        if (!entry) continue
-        try { entry.watcher && entry.watcher.close() } catch {}
-        if (entry.timer) clearTimeout(entry.timer)
-      }
-      autoPushWatchers.clear()
-    }
+
   }
 
   // If no stored current, adopt a CLI-provided default as the active machine —
@@ -1041,80 +1053,6 @@ export async function apply(ctx, config) {
   pool.onReady = (client) => forwards.attach(client)
   pool.onCloseHook = () => forwards.detach()
 
-  // ── auto-push watcher (config.autoPush, default off) ──────────────────────
-  // Watches the local mirror; local edits are pushed back to the remote after a
-  // 3s debounce, honoring ignore rules + the three-way conflict guard (a remote
-  // change is never clobbered — it is recorded as a conflict in the audit log).
-  const autoPushWatchers = new Map() // localDir → { watcher, pending:Set, timer }
-  const flushAutoPush = async (localDir) => {
-    const entry = autoPushWatchers.get(localDir)
-    if (!entry || !entry.pending.size) return
-    const rels = [...entry.pending]
-    entry.pending.clear()
-    // Resolve the destination from the WATCHED MIRROR, not from the active
-    // machine: a watcher outlives any one session, so gating on the active
-    // machine made it silently stop pushing (and, before per-machine pools,
-    // risked pushing one host's mirror through another host's connection).
-    const { remotePath: ws, machine, mapping } = resolveMirrorForLocal(localDir)
-    if (!ws || !machine) return
-    const syncFile = mappingSyncFile(mapping, machine)
-    await runMappingTransfer(mapping, syncFile, async () => {
-      const target = poolForMachine(machine)
-      let sftp
-      try { sftp = await target.sftp() } catch { return }
-      const matcher = ignoreMatcher(ws)
-      const state = loadSyncState(localDir, syncFile)
-      const next = { ...state }
-      if (rels.includes('*')) {
-        const r = await pushTree(sftp, localDir, ws, { maxFiles: 2000, maxFileBytes: config.maxFileBytes, isIgnored: matcher, state: next, protectExisting: !!mapping })
-        Object.assign(next, r.nextState)
-        for (const c of r.stats.conflicts) audit('auto-push-conflict', `push ${c.path}`, 1, machine)
-      } else {
-        for (const rel of rels) {
-          const r = await pushOneFile(sftp, localDir, ws, rel, { maxFileBytes: config.maxFileBytes, isIgnored: matcher, state: next, protectExisting: !!mapping })
-          if (r.state) Object.assign(next, r.state)
-          else if (r.status === 'conflict') audit('auto-push-conflict', `push ${rel}`, 1, machine)
-        }
-      }
-      saveSyncState(localDir, next, syncFile)
-    })
-  }
-  const startAutoPush = (localDir) => {
-    if (!config.autoPush || autoPushWatchers.has(localDir)) return
-    const entry = { pending: new Set(), timer: null, watcher: null }
-    const schedule = () => {
-      if (entry.timer) clearTimeout(entry.timer)
-      entry.timer = setTimeout(() => { void flushAutoPush(localDir).catch(() => {}) }, 3000)
-    }
-    const onEvent = (eventType, filename) => {
-      if (!filename) { entry.pending.add('*'); return schedule() }
-      const rel = String(filename).replace(/\\/g, '/')
-      if (rel === '.dsh-remote-meta.json' || rel === '.dsh-remote-sync-state.json' || rel.startsWith('.dsh-remote-sync-state.json.tmp')) return
-      entry.pending.add(rel)
-      schedule()
-    }
-    try {
-      entry.watcher = watch(localDir, { recursive: true }, onEvent)
-    } catch {
-      try { entry.watcher = watch(localDir, onEvent) } catch { return }
-    }
-    autoPushWatchers.set(localDir, entry)
-  }
-  const stopAutoPush = (localDir) => {
-    const entry = autoPushWatchers.get(localDir)
-    if (!entry) return
-    clearTimeout(entry.timer)
-    entry.watcher.close()
-    autoPushWatchers.delete(localDir)
-  }
-  ctx.effect(() => () => {
-    for (const e of autoPushWatchers.values()) {
-      if (e.timer) clearTimeout(e.timer)
-      try { e.watcher && e.watcher.close() } catch {}
-    }
-    autoPushWatchers.clear()
-  }, 'dsh-remote.autopush')
-
   // ── remote instruction-file index (issue #68) ────────────────────────────
   // The core AGENTS.md loader only sees the LOCAL mirror, so a remote repo's
   // instruction files never reach the model's context. This index shallow-
@@ -1183,59 +1121,29 @@ export async function apply(ctx, config) {
 
   // ── remote workspace state ────────────────────────────────────────────────
   const wsPath = () => (config.workspace || '').trim()
-  /** Map a LOCAL path to the remote path its mirror represents ('' when the
-   *  path is not inside any dsh-remote mirror). Shared by the resolve-mirror
-   *  route, the session-aware system-prompt injection, and status().
-   *
-   *  `machine` carries the mirror's recorded origin (`host`/`port`/`username`
-   *  from `.dsh-remote-meta.json`), or null when the path is not inside a
-   *  mirror. That origin is what makes a session's remote target authoritative
-   *  without consulting the mutable active-machine state, so a concurrent
-   *  session switching machines cannot redirect this session's commands. */
-  const resolveMirrorForLocal = (local) => {
-    const mapping = mappingForLocal(remoteWorkspacesRoot(), local)
-    if (!mapping) return resolveMirror(local, remoteWorkspacesRoot())
-    const rec = machines[machineIndex(mapping.machineId)]
-    if (!rec) return { mirrorDir: null, remotePath: '', machine: null }
-    return {
-      mirrorDir: mapping.localPath,
-      remotePath: mapping.remotePath,
-      machine: { ...identityOf(rec), alias: aliasOf(rec), machineId: rec.id },
-      mapping,
-    }
-  }
+  // A regular checkout stays local even when a remote workspace syncs to it.
+  const sessionWorkspace = cwd => resolveMirror(cwd, remoteWorkspacesRoot())
   const mappingSyncFile = (mapping, machine) => {
     if (!mapping) return undefined
     const target = createHash('sha256').update(JSON.stringify([mapping.revision, poolKey(machine)])).digest('hex')
     return path.join(remoteWorkspacesRoot(), '.mapping-sync', target + '.json')
   }
-  const mappingTransfers = new Map()
-  const runMappingTransfer = (mapping, syncFile, operation) => {
-    if (!mapping) return operation()
-    const previous = mappingTransfers.get(mapping.id) || Promise.resolve()
+  const workspaceTransfers = new Map()
+  const runWorkspaceTransfer = (localDir, mapping, syncFile, operation) => {
+    const previous = workspaceTransfers.get(localDir) || Promise.resolve()
     const current = previous.catch(() => {}).then(() => {
-      const live = resolveMirrorForLocal(mapping.localPath)
-      if (live.mapping?.revision !== mapping.revision || mappingSyncFile(live.mapping, live.machine) !== syncFile) {
-        throw new Error('The directory mapping changed. Reopen the workspace and retry.')
+      if (mapping) {
+        const live = mappingForLocal(remoteWorkspacesRoot(), mapping.localPath)
+        const record = machines[machineIndex(mapping.machineId)]
+        if (!record || live?.revision !== mapping.revision || mappingSyncFile(live, identityOf(record)) !== syncFile) {
+          throw new Error('The directory mapping changed. Reopen the workspace and retry.')
+        }
       }
       return operation()
     })
-    mappingTransfers.set(mapping.id, current)
+    workspaceTransfers.set(localDir, current)
     return current.finally(() => {
-      if (mappingTransfers.get(mapping.id) === current) mappingTransfers.delete(mapping.id)
-    })
-  }
-  const mappedWorkspaceViews = () => {
-    let mappings
-    try { mappings = readMappings(remoteWorkspacesRoot()) } catch { return [] }
-    return mappings.flatMap(mapping => {
-      const rec = machines[machineIndex(mapping.machineId)]
-      if (!rec) return []
-      const machine = identityOf(rec)
-      return [{
-        dir: mapping.localPath, remotePath: mapping.remotePath,
-        ...machine, alias: aliasOf(rec), name: rec.name || rec.host,
-      }]
+      if (workspaceTransfers.get(localDir) === current) workspaceTransfers.delete(localDir)
     })
   }
 
@@ -1281,15 +1189,18 @@ export async function apply(ctx, config) {
             port: Number(meta.port) || 22,
             username: String(meta.username || ''),
             alias: String(meta.alias || ''),
+            machineId: String(meta.machineId || ''),
           }
           const rec = machineRecordFor(origin)
           out.push({
             dir: path.resolve(dir),
+            localPath: meta.mapping?.localPath || path.resolve(dir),
             host: origin.host,
             port: origin.port,
             username: origin.username,
             remotePath: String(meta.remotePath || ''),
             alias: origin.alias,
+            machineId: origin.machineId || rec?.id || null,
             // A saved machine's display name, when this mirror resolves to one:
             // the UI prefers the friendly name over the raw address in its
             // tooltip (the row itself shows the address, which is what the
@@ -1302,108 +1213,6 @@ export async function apply(ctx, config) {
     return out
   }
 
-  /**
-   * Rebind every mirror recorded for one machine identity to a NEW identity
-   * (issue #67): when a machine's IP/user/port changes, its workspaces must
-   * follow instead of being recreated. The mirror's `.dsh-remote-meta.json` is
-   * the authoritative binding — session routing (bindingFor), pool keying
-   * (poolForMachine) and the sidebar badges all read identity FROM THE META,
-   * not from the directory name — so rewriting the meta re-points every live
-   * session at the new address while the local mirror content stays put.
-   *
-   * The host directory itself is deliberately NOT renamed: live sessions hold
-   * cwd paths inside it, and a rename would dangle them into "session is
-   * LOCAL" refusals (on Windows the rename usually fails outright while a
-   * shell sits inside). The directory name is a display label only; a stale
-   * label after a rebind is the documented cost of keeping sessions alive.
-   *
-   * Matching covers both machine kinds: an ALIAS machine's mirrors are found
-   * through the recorded `alias` (their meta host is the resolved address at
-   * creation time), a literal machine's through host+port+username.
-   *
-   * @param {object} prev - the machine record BEFORE the identity change.
-   * @param {object} next - the machine record AFTER it.
-   * @returns {number} how many mirrors were rebound.
-   */
-  const rebindMirrors = (prev, next) => {
-    if (!prev || !next) return 0
-    const prevAlias = aliasOf(prev)
-    const prevId = identityOf(prev)
-    const prevRaw = { host: String(prev.host || ''), port: Number(prev.port) || 22, username: String(prev.username || '') }
-    const nextAlias = aliasOf(next)
-    const nextEff = withSshConfig(next) || next
-    const nextId = {
-      host: String(nextEff.host || next.host || ''),
-      port: Number(nextEff.port || next.port) || 22,
-      username: String(nextEff.username || next.username || ''),
-    }
-    const nextRaw = { host: String(next.host || ''), port: Number(next.port) || 22, username: String(next.username || '') }
-    const sameIdentity = (a, b) => a.host === b.host && a.port === b.port && a.username === b.username
-    if (!prevAlias && sameIdentity(prevId, nextId) && sameIdentity(prevRaw, nextRaw)) return 0
-    if (prevAlias && prevAlias === nextAlias) return 0
-    const root = remoteWorkspacesRoot()
-    let rebound = 0
-    let hostDirs = []
-    try { hostDirs = readdirSync(root) } catch { return 0 }
-    for (const hostDir of hostDirs) {
-      const hostPath = path.join(root, hostDir)
-      if (!statSync(hostPath, { throwIfNoEntry: false })?.isDirectory?.()) continue
-      let entries = []
-      try { entries = readdirSync(hostPath) } catch { continue }
-      for (const entry of entries) {
-        const metaPath = path.join(hostPath, entry, '.dsh-remote-meta.json')
-        let meta = null
-        try { meta = JSON.parse(readFileSync(metaPath, 'utf8')) } catch { continue }
-        if (!meta || !meta.host) continue
-        const byAlias = prevAlias && String(meta.alias || '') === prevAlias
-        // A meta records the RESOLVED identity at pick time, but that identity
-        // can also have been written raw — match on either form of the old
-        // identity so a rebind still finds mirrors recorded before a later
-        // ssh-config resolution rewrote what "this machine" meant.
-        const metaId = { host: String(meta.host), port: Number(meta.port) || 22, username: String(meta.username || '') }
-        const byIdentity = sameIdentity(metaId, prevId) || sameIdentity(metaId, prevRaw)
-        if (!byAlias && !byIdentity) continue
-        const updated = { ...meta }
-        if (nextAlias) {
-          // Alias machine: the recorded alias is what future resolution keys
-          // on; the resolved address refreshes only when it actually resolved
-          // (an unmatched alias keeps the old literal values rather than
-          // stamping the alias NAME into the address fields).
-          updated.alias = nextAlias
-          if (nextEff.sshConfigMatched || nextEff.sshAlias) {
-            updated.host = nextId.host
-            updated.port = nextId.port
-            updated.username = nextId.username
-          }
-        } else {
-          delete updated.alias
-          updated.host = nextRaw.host
-          updated.port = nextRaw.port
-          updated.username = nextRaw.username
-        }
-        updated.reboundAt = new Date().toISOString()
-        try {
-          writeFileSync(metaPath, JSON.stringify(updated, null, 2))
-          rebound++
-        } catch { /* leave that mirror as-is */ }
-      }
-    }
-    if (rebound) {
-      // The old identity's pooled connection dials an address the user just
-      // abandoned: drop it so nothing keeps a dead SSH session warm. The new
-      // identity gets its pool lazily on the next tool call.
-      const stale = machinePools.get(poolKey(prevId))
-      if (stale) {
-        machinePools.delete(poolKey(prevId))
-        try { stale.close() } catch { /* already gone */ }
-      }
-    }
-    return rebound
-  }
-
-  if (config.autoPush && wsPath()) {
-    startAutoPush(mirrorDirFor(wsPath(), config.host, config.username, config.port))
-  }
   /** The remote path one agent session is bound to, or '' when that session is
    *  a plain local one. Walks the mirror registry (host side copy of the
    *  resolve-mirror logic) so status / prompt / sidebar agree.
@@ -1485,7 +1294,7 @@ export async function apply(ctx, config) {
   const sessionRemotePath = (sessionId) => {
     const cwd = sessionCwd(sessionId)
     if (!cwd) return ''
-    return resolveMirrorForLocal(cwd).remotePath
+    return sessionWorkspace(cwd).remotePath
   }
 
   /**
@@ -1495,10 +1304,13 @@ export async function apply(ctx, config) {
    */
   const resolveRequestBinding = async (req, body = {}) => {
     const hint = requestSessionHint(req, body)
-    let cwd = hint.local
-    if (!cwd && hint.sessionId) cwd = lookupSessionCwd(hint.sessionId, { sessions: sessionsSvc(), dshHome: dshBase() })
+    const cwd = hint.sessionId
+      ? lookupSessionCwd(hint.sessionId, { sessions: sessionsSvc(), dshHome: dshBase() })
+      : hint.local
+    if (hint.sessionId && !cwd) throw codedError('SESSION_NOT_FOUND', 'Could not resolve the requested session workspace.', { httpStatus: 404 })
     if (cwd) {
-      const { remotePath, machine, mirrorDir, mapping } = resolveMirrorForLocal(cwd)
+      const { remotePath, machine, mirrorDir, mapping, broken } = sessionWorkspace(cwd)
+      if (broken) throw codedError('REMOTE_BINDING_MISSING', 'The remote workspace binding is missing or invalid.', { httpStatus: 409 })
       if (remotePath && machine) {
         return {
           pool: poolForMachine(machine),
@@ -1507,6 +1319,7 @@ export async function apply(ctx, config) {
           username: machine.username,
           port: machine.port,
           alias: machine.alias || '',
+          machineId: machine.machineId,
           mirrorDir,
           mapping,
           syncFile: mappingSyncFile(mapping, machine),
@@ -1586,7 +1399,8 @@ export async function apply(ctx, config) {
   const bindingFor = (exec) => {
     const cwd = exec?.agent?.session?.header?.cwd
     if (cwd) {
-      const { remotePath, machine, mirrorDir, mapping } = resolveMirrorForLocal(String(cwd))
+      const { remotePath, machine, mirrorDir, mapping, broken } = sessionWorkspace(cwd)
+      if (broken) throw codedError('REMOTE_BINDING_MISSING', 'The remote workspace binding is missing or invalid.')
       if (remotePath && machine) {
         return {
           pool: poolForMachine(machine),
@@ -1595,6 +1409,7 @@ export async function apply(ctx, config) {
           username: machine.username,
           port: machine.port,
           alias: machine.alias || '',
+          machineId: machine.machineId,
           mirrorDir,
           mapping,
           syncFile: mappingSyncFile(mapping, machine),
@@ -1801,11 +1616,12 @@ export async function apply(ctx, config) {
     // `=== false` rather than falsy: a partially-specified config (a scripted
     // apply(), an older profile) must still get the remote listing, which is
     // what the schema default promises.
-    if (config.fileReference === false) return null
     const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : ''
     if (!cwd) return null
-    const { remotePath, machine } = resolveMirrorForLocal(String(cwd))
+    const { remotePath, machine, broken } = sessionWorkspace(cwd)
+    if (broken) throw codedError('REMOTE_BINDING_MISSING', 'The remote workspace binding is missing or invalid.')
     if (!remotePath || !machine) return null
+    if (config.fileReference === false) return { list: () => [] }
     const root = normalizeRemotePath(remotePath)
     const key = poolKey(machine) + '\u0000' + root
     const cached = fileReferenceProviders.get(key)
@@ -1883,6 +1699,17 @@ export async function apply(ctx, config) {
     schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
     render: (_a, v) => [{ type: 'text', text: v.text }],
   }
+  const localWorkspaceEntry = (exec, requested) => {
+    const workspace = sessionWorkspace(exec?.agent?.session?.header?.cwd)
+    if (!workspace.mirrorDir) throw new Error('This session has no local mirror directory.')
+    const root = realpathSync(workspace.mirrorDir)
+    const entry = realpathSync(path.resolve(root, requested || '.'))
+    const relative = path.relative(root, entry)
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      throw new Error('Choose a path inside the local mirror.')
+    }
+    return entry
+  }
   const okOut = {
     schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true }, bytes: { type: 'integer' }, text: { type: 'string' } } },
     render: (_a, a) => [{ type: 'text', text: a.text || (a.ok ? 'ok' : 'failed') }],
@@ -1944,10 +1771,10 @@ export async function apply(ctx, config) {
     defineTool({
       name: 'rw_connect',
       description:
-        'Connect SSH to a remote host for remote workspace work. Two ways (issue #48): (1) pass machineId to connect with a machine ALREADY SAVED in the registry (list them with rw_machines) — every stored setting applies: password/keychain password, privateKeyPath + passphrase, useAgent, keyboardInteractive, proxy, hostKeyMode, backend, and ~/.ssh/config aliases; or (2) pass host plus any of username/port/password/privateKeyPath/passphrase/useAgent/keyboardInteractive/hostKeyMode/backend/name. Defaults to saving the machine to the registry (save=false keeps it as a temporary connection). Once connected, call rw_pick_workspace to pick the workspace directory this session should work in. With useSshConfig=true, `host` is an ALIAS from ~/.ssh/config and every value (HostName/user/port/IdentityFile/ProxyJump) is read from that file at connect time. For a host that only accepts GSSAPI/Kerberos (issue #51), pass backend="openssh" (with useSshConfig=true) so the local ssh — which holds your kinit ticket — performs the login. A failed connection is reported as an error message — it never takes the plugin down. Rebinding (issue #67): pass machineId TOGETHER with a new host/username/port to update that saved machine in place — every workspace mirror bound to its old address is re-pointed (local content kept, no re-sync) instead of forcing new workspaces.',
+        'Connect SSH to a remote host for remote workspace work. Two ways (issue #48): (1) pass machineId to connect with a machine ALREADY SAVED in the registry (list them with rw_machines) — every stored setting applies: password/keychain password, privateKeyPath + passphrase, useAgent, keyboardInteractive, proxy, hostKeyMode, backend, and ~/.ssh/config aliases; or (2) pass host plus any of username/port/password/privateKeyPath/passphrase/useAgent/keyboardInteractive/hostKeyMode/backend/name. Defaults to saving the machine to the registry (save=false keeps it as a temporary connection). Once connected, call rw_pick_workspace to pick the workspace directory this session should work in. With useSshConfig=true, `host` is an ALIAS from ~/.ssh/config and every value (HostName/user/port/IdentityFile/ProxyJump) is read from that file at connect time. For a host that only accepts GSSAPI/Kerberos (issue #51), pass backend="openssh" (with useSshConfig=true) so the local ssh — which holds your kinit ticket — performs the login. A failed connection is reported as an error message — it never takes the plugin down. An address change requires opening a new remote workspace.',
       parameters: {
         host: { type: 'string', description: 'Remote host IP or hostname (or a ~/.ssh/config alias with useSshConfig=true). Required unless machineId is given.' },
-        machineId: { type: 'string', description: 'Connect with a saved machine from the registry (see rw_machines): all its stored settings apply and it becomes the current machine. host/other fields are not needed — EXCEPT for rebinding (issue #67): combine machineId with a new host/username/port to update the machine in place and re-point its existing workspace mirrors.' },
+        machineId: { type: 'string', description: 'Connect with a saved machine from the registry (see rw_machines): all its stored settings apply and it becomes the current machine. host/other fields are not needed — Supply host, username, or port to update the saved record for new workspaces.' },
         username: { type: 'string', description: 'SSH user (default from config or root)' },
         port: { type: 'integer', description: 'SSH port (default 22)' },
         password: { type: 'string', description: 'SSH password (prefer SSH key when possible)' },
@@ -1964,9 +1791,6 @@ export async function apply(ctx, config) {
       },
       output: textOut,
       async execute(args) {
-        // Issue #67: set by the machineId+overrides path, prepended to the
-        // success line so the rebind is visible in the tool result.
-        let reboundNote = ''
         const mid = String(args.machineId || '').trim()
         if (mid) {
           // Connect with an ALREADY SAVED machine (issue #48): the registry
@@ -1974,25 +1798,11 @@ export async function apply(ctx, config) {
           // keychain-backed passwords, stored passphrases, proxies, aliases.
           const i = machineIndex(mid)
           if (i < 0) throw new Error(`rw_connect: no saved machine "${mid}" — list saved machines with rw_machines`)
-          // Issue #67: passing host/username/port ALONGSIDE a machineId rebinds
-          // the saved machine in place — the fix for "the IP changed, do not
-          // make me recreate every workspace". The record keeps its id (and
-          // every credential), and each mirror bound to the old identity is
-          // re-pointed so live sessions keep working against the new address.
-          const prev = machines[i]
           const overrides = {}
           if (args.host !== undefined && String(args.host).trim()) overrides.host = String(args.host).trim()
           if (args.username !== undefined && String(args.username).trim()) overrides.username = String(args.username).trim()
           if (args.port !== undefined && Number(args.port)) overrides.port = Number(args.port)
-          let rebound = 0
-          if (Object.keys(overrides).length) {
-            const next = { ...prev, ...overrides }
-            try { rebound = rebindMirrors(prev, next) } catch { /* best effort */ }
-            machines[i] = next
-          }
-          if (rebound) {
-            reboundNote = `Rebound ${rebound} workspace mirror(s) from ${prev.username}@${prev.host}:${prev.port} to the new address (local content kept — no re-sync needed).\n`
-          }
+          machines[i] = { ...machines[i], ...overrides }
           store.currentId = machines[i].id
           ephemeral = null
           saveMachines(machines, store.currentId)
@@ -2103,7 +1913,7 @@ export async function apply(ctx, config) {
           const via = active && active.sshAlias
             ? `\n(ssh-config alias "${active.sshAlias}" → ${effUser}@${effHost}:${effPort}` + (active.sshConfigWarnings && active.sshConfigWarnings.length ? `; ${active.sshConfigWarnings.join(' ')}` : '') + ')'
             : ''
-          return { text: `${reboundNote}Connected to ${effHost} as ${effUser}.${via}\n\npick a workspace with rw_pick_workspace (path=<abs>).` }
+          return { text: `Connected to ${effHost} as ${effUser}.${via}\n\npick a workspace with rw_pick_workspace (path=<abs>).` }
         } catch (err) {
           throw new Error(friendlyMessage(err, { host: effHost, port: effPort }))
         }
@@ -2173,7 +1983,7 @@ export async function apply(ctx, config) {
     defineTool({
       name: 'rw_pick_workspace',
       description:
-        'Set the remote workspace directory this session should treat as its working root on the connected remote. Verifies it exists (a directory). Use rw_list_dir to browse first if unsure. Accepts POSIX (/home/dev/project) or Windows (C:\\Users\\dev\\project) paths.',
+        'Prepare a directory on the selected SSH host to open as a separate remote workspace. Verifies it exists and leaves the current session binding in place.',
       parameters: {
         path: { type: 'string', required: true, description: 'Absolute remote directory path, e.g. /home/dev/code/project or C:\\Users\\dev\\project' },
       },
@@ -2203,19 +2013,11 @@ export async function apply(ctx, config) {
         // A bound session's workspace lives in its own mirror meta, so the
         // shared active-machine workspace is only updated for the unbound flow.
         if (!b.bound) persistWorkspace(p)
-        const local = ensureMirror(p, b.host, b.username, b.port, { alias: b.alias || "" })
-        startAutoPush(local)
-        // Issue #68: discover the workspace's AGENTS.md / CLAUDE.md NOW — the
-        // first prompt assembly can come before any rw_sync, and the mirror
-        // copy must already be in place for the core instruction loader to
-        // pick it up. Awaited (the scan is a handful of shallow readdirs) but
-        // fully best-effort: a scan failure never fails the pick.
-        try { await instructionIndex.refresh({ pool: b.pool, ws: p, mirrorDir: local, force: true }) } catch { /* best effort */ }
-        // The closing hint depends on where THIS session stands (issue #63):
-        // in a LOCAL session "Run rw_sync" is a dead instruction — rw_sync
-        // refuses a local session — so say the mirror must be OPENED first.
+        const local = ensureMirror(p, b.host, b.username, b.port, { alias: b.alias, machineId: b.machineId })
+        // Discover instructions directly over SSH so an empty checkout works.
+        try { await instructionIndex.refresh({ pool: b.pool, ws: p, mirrorDir: local, writeMirror: false, force: true }) } catch { /* best effort */ }
         return {
-          text: `Remote workspace set to ${shown} on ${b.username}@${b.host}.\nLocal mirror (native workspace path): ${local}\n\n${pickWorkspaceNextStep(b.local)}`,
+          text: `Remote workspace prepared at ${shown} on ${b.username}@${b.host}.\nOpen a new session from the remote workspace picker.\nDSH workspace path: ${local}`,
         }
       },
     }),
@@ -2277,10 +2079,10 @@ export async function apply(ctx, config) {
           return r
         }
         if (args.async) {
-          const t = tasks.start('sync', `sync ${p}`, () => runMappingTransfer(b.mapping, b.syncFile, runSyncAndIndex))
+          const t = tasks.start('sync', `sync ${p}`, () => runWorkspaceTransfer(local, b.mapping, b.syncFile, runSyncAndIndex))
           return { text: `sync started in background: taskId=${t.id} (GET /dsh-remote/task?id=${t.id} for progress)` }
         }
-        return runMappingTransfer(b.mapping, b.syncFile, runSyncAndIndex)
+        return runWorkspaceTransfer(local, b.mapping, b.syncFile, runSyncAndIndex)
       },
     }),
 
@@ -2327,10 +2129,37 @@ export async function apply(ctx, config) {
           return { text }
         }
         if (args.async) {
-          const t = tasks.start('push', `push ${p}`, () => runMappingTransfer(b.mapping, b.syncFile, runPush))
+          const t = tasks.start('push', `push ${p}`, () => runWorkspaceTransfer(local, b.mapping, b.syncFile, runPush))
           return { text: `push started in background: taskId=${t.id} (GET /dsh-remote/task?id=${t.id} for progress)` }
         }
-        return runMappingTransfer(b.mapping, b.syncFile, runPush)
+        return runWorkspaceTransfer(local, b.mapping, b.syncFile, runPush)
+      },
+    }),
+
+    defineTool({
+      name: 'rw_local_list_dir',
+      description: 'List the local checkout or mirror only when the user explicitly requests local files. The SSH project is accessed with rw_list_dir.',
+      parameters: { path: { type: 'string', description: 'Path inside the local mirror (default: its root)' } },
+      output: textOut,
+      async execute(args, exec) {
+        const dir = localWorkspaceEntry(exec, args.path)
+        const entries = readdirSync(dir, { withFileTypes: true })
+        const listing = entries.slice(0, 400).map(entry => entry.name + (entry.isDirectory() ? '/' : ''))
+        if (entries.length > listing.length) listing.push('(listing truncated)')
+        return { text: 'Local directory ' + dir + '\n' + (listing.join('\n') || '(empty directory)') }
+      },
+    }),
+
+    defineTool({
+      name: 'rw_local_read_file',
+      description: 'Read a local checkout or mirror file only when the user explicitly requests the local copy.',
+      parameters: { path: { type: 'string', required: true, description: 'File path inside the local mirror' } },
+      output: textOut,
+      async execute(args, exec) {
+        const file = localWorkspaceEntry(exec, args.path)
+        const st = statSync(file)
+        if (!st.isFile() || st.size > 256 * 1024) throw new Error('Choose a local text file no larger than 256 KiB.')
+        return { text: 'Local file ' + file + '\n' + readFileSync(file, 'utf8') }
       },
     }),
 
@@ -2655,6 +2484,7 @@ export async function apply(ctx, config) {
         const b = requireMachine(exec, 'rw_move')
         // Remote sandbox fence: a write must be permitted by this session's resolved mode.
         requireRemoteSandbox(exec, 'write', { tool: 'rw_move', path: String(args.source || args.path || '') })
+        requireRemoteSandbox(exec, 'write', { tool: 'rw_move', path: String(args.dest || '') })
         const p = resolveRemoteArg(b, args.path)
         const d = resolveRemoteArg(b, args.dest)
         if (!p || !d || p === '/') throw new Error('rw_move: both path and dest are required')
@@ -2698,7 +2528,9 @@ export async function apply(ctx, config) {
           if (b.pool.platform === 'windows' && b.pool.gitBashPath) {
             // Git Bash terminal: cd in the /c/Users/… mount form
             full = `cd ${shq(toShellPath(cwd))} && ${cmd}`
-          } else if (!cwd.includes('\\')) {
+          } else if (b.pool.platform === 'windows') {
+            throw new Error('Running commands in this Windows SSH workspace requires Git Bash. Set the remote shell in dsh-remote.')
+          } else {
             full = `cd ${shq(cwd)} && ${cmd}`
           }
         }
@@ -2830,7 +2662,7 @@ export async function apply(ctx, config) {
         } else {
           const ws = b.ws
           if (!ws) throw new Error('rw_download: no remote workspace set — pass localPath explicitly')
-          const base = mirrorDirFor(ws, b.host, b.username, b.port)
+          const base = b.mirrorDir || mirrorDirFor(ws, b.host, b.username, b.port)
           const rel = p.startsWith(ws) ? p.slice(ws.length).replace(/^\/+/, '') : p.slice(1)
           local = path.join(base, rel)
         }
@@ -2935,6 +2767,16 @@ export async function apply(ctx, config) {
   for (const t of tools) {
     ctx.tools.register(t)
   }
+  installWorkspaceToolRouting(ctx, {
+    workspaceFor: agent => {
+      const cwd = agent?.session?.header?.cwd
+      if (!cwd) return undefined
+      const workspace = sessionWorkspace(cwd)
+      return workspace.machine || workspace.broken ? 'remote' : 'local'
+    },
+    localMode: normalizeLocalTools(config.localTools),
+    bootstrap: LOCAL_BOOTSTRAP_TOOLS,
+  })
 
   // ── system-prompt injection: session-aware remote workspace ──────────────
   // Issue #13: remote context must be SESSION-scoped, not machine-global.
@@ -2943,24 +2785,50 @@ export async function apply(ctx, config) {
   // dsh-remote mirror (i.e. the user picked a remote workspace as the session
   // workspace). A plain local session gets no remote section — saved machines
   // never leak their workspace into an unrelated local session's prompt.
-  // (resolveMirrorForLocal is defined above, next to wsPath.)
+  const promptWorkspace = ({ agent } = {}) => {
+    const cwd = agent?.session?.header?.cwd
+    if (!cwd) return undefined
+    const workspace = sessionWorkspace(cwd)
+    if (workspace.broken) return workspace
+    return workspace.remotePath && workspace.machine ? workspace : undefined
+  }
+  const remoteWorkspaceContext = ({ remotePath, machine, mirrorDir, mapping }) => [
+    'Workspace mode: remote over SSH.',
+    'SSH host: ' + (machine.username || 'user') + '@' + machine.host + ' (port ' + machine.port + ').',
+    'Remote working directory: ' + JSON.stringify(remotePath) + '.',
+    (mapping ? 'Local mirror checkout: ' : 'Local mirror: ') + JSON.stringify(mirrorDir) + '.',
+    'DSH reports the local session path in its "Current working directory" entry. Report the SSH host and remote working directory as the workspace location.',
+    'Inspect the current workspace with rw_list_dir. An empty local mirror does not tell you whether the remote directory is empty.',
+  ].join('\n')
+
+  // The host refreshes runtime context again immediately before each model
+  // request. Register a required fact so it also survives that refresh and
+  // presets that replace the system prompt or suppress optional context.
+  const hasRuntimeContext = typeof ctx.systemPrompt.context === 'function'
+  if (hasRuntimeContext) {
+    ctx.systemPrompt.context({
+      name: 'dsh-remote:workspace',
+      order: (ctx.systemPrompt.getContextOrder?.('WORKING_DIRECTORY') ?? 100) + 1,
+      required: true,
+      interpolate: false,
+      text: (context) => {
+        const workspace = promptWorkspace(context)
+        if (workspace?.broken) return 'This is a remote session with a missing workspace binding. Report the binding error.'
+        return workspace ? remoteWorkspaceContext(workspace) : ''
+      },
+    })
+  }
   ctx.systemPrompt.section({
     name: 'dsh-remote',
     order: 88,
+    interpolate: false,
     text: (promptContext) => {
-      const agent = promptContext && promptContext.agent
-      const session = agent && agent.session
-      const cwd = session && session.header && session.header.cwd
-      if (!cwd) return '' // no session cwd → nothing to map → stay quiet
-      const { remotePath, machine, mirrorDir, mapping } = resolveMirrorForLocal(cwd)
-      if (!remotePath) return '' // this session is NOT a remote session (issue #13)
-      // Name the machine the MIRROR records, not the active one: pairing this
-      // session's remote path with whichever machine happens to be active
-      // states a host/path combination that may not exist (issue #25).
-      const who = machine
-        ? `${machine.username || 'user'}@${machine.host}`
-        : `${config.username || 'user'}@${config.host}`
-      const platform = machine ? poolForMachine(machine).platform : pool.platform
+      const workspace = promptWorkspace(promptContext)
+      if (!workspace || workspace.broken) return ''
+      const { remotePath, machine, mirrorDir } = workspace
+      let remotePool
+      try { remotePool = poolForMachine(machine) } catch { /* Workspace facts still apply while SSH is unavailable. */ }
+      const platform = remotePool?.platform
       const shown = toDisplayPath(remotePath, platform)
       const fwd = forwards.list().filter((f) => f.active).map((f) => `${f.direction}:127.0.0.1:${f.listenPort}→${f.targetHost}:${f.targetPort}`)
       let extra = ''
@@ -2969,8 +2837,8 @@ export async function apply(ctx, config) {
       // lazy (fire-and-forget on first assembly; negative-cached on failure),
       // so the index appears from the NEXT assembly once known — rw_pick_workspace
       // scans eagerly, so a picked workspace normally has it from the start.
-      if (machine && mirrorDir) {
-        instructionIndex.note({ pool: poolForMachine(machine), ws: remotePath, mirrorDir, writeMirror: !mapping })
+      if (mirrorDir && remotePool) {
+        instructionIndex.note({ pool: remotePool, ws: remotePath, mirrorDir, writeMirror: false })
         const instr = instructionIndex.get(mirrorDir)
         if (instr && instr.files && instr.files.length) {
           extra += `\n${formatInstructionIndex(instr.files, (p) => toDisplayPath(p, platform))}`
@@ -2981,50 +2849,14 @@ export async function apply(ctx, config) {
       // and that the built-in read tool sees only the local mirror.
       return (
         '## Remote workspace\n' +
-        `Current remote workspace: ${who}:${shown}\n` +
-        'Use the rw_* tools (rw_list_dir / rw_read_file / rw_write_file / rw_edit / rw_exec / rw_search / rw_sync / rw_push) to inspect and act on files on the remote host. Treat this directory as the working root for this task.\n' +
+        (hasRuntimeContext ? '' : remoteWorkspaceContext(workspace) + '\n') +
+        'Use the available SSH tools for this workspace. Use rw_local_list_dir or rw_local_read_file only for an explicit request about the local mirror. Pull or push files from the remote workspace panel.\n' +
         `\`@path\` mentions in this conversation name files under THAT remote root (\`@src/main.c\` = ${shown}/src/main.c). ` +
-        'The rw_* tools take such paths as workspace-relative and resolve them against this root. ' +
-        (mapping
-          ? "The session's normal file and shell tools work in the existing local checkout. Use rw_* for the linked remote directory and rw_push or rw_sync when you intentionally synchronize."
-          : 'The built-in read/list tools see the local mirror; use rw_read_file for the remote copy.') +
+        'The rw_* tools resolve relative paths against this remote root.' +
         extra
       )
     },
   })
-
-  // ── local-session tool visibility (issue #63) ────────────────────────────
-  // All rw_* tools register globally (at registration time there is no session
-  // to consult), but in a LOCAL session the operation tools can never succeed:
-  // bindingFor() refuses them with "this session is LOCAL". Exposing them
-  // anyway costs every local request a few thousand tokens of dead schema.
-  // The `system-prompt/assemble` waterfall is where the final per-request tool
-  // list passes with the calling agent attached, so the SAME cwd test the
-  // prompt section above already performs can trim the list there. A session
-  // whose cwd maps to a mirror keeps the full surface; anything else — a
-  // plain local directory, or a mirror whose meta is missing/unparsable
-  // (resolveMirror reports no binding; bindingFor refuses it as local too) —
-  // is reduced per config.localTools. An assembly without agent/cwd is left
-  // alone, matching bindingFor's "no caller context" semantics. `ctx.on` is
-  // cordis-core, but guard like the other
-  // optional surfaces: a minimal embedding (or a small test double) without
-  // event support simply keeps the legacy full surface.
-  if (typeof ctx.on === 'function') {
-    ctx.on('system-prompt/assemble', async (_assembly, assembleContext, next) => {
-      const assembled = await next()
-      const mode = normalizeLocalTools(config.localTools)
-      if (mode === 'all') return assembled
-      const agent = assembleContext && assembleContext.agent
-      const cwd = agent && agent.session && agent.session.header && agent.session.header.cwd
-      if (!cwd) return assembled // no caller context → not definitively local
-      const { remotePath, machine } = resolveMirrorForLocal(String(cwd))
-      if (remotePath && machine) return assembled // remote session → full surface
-      const tools = (assembled.tools || []).filter(
-        (t) => !t.name || !t.name.startsWith('rw_') || (mode === 'bootstrap' && LOCAL_BOOTSTRAP_TOOLS.includes(t.name)),
-      )
-      return { ...assembled, tools }
-    })
-  }
 
   // ── dynamic remote instruction injection (issue #71) ──────────────────────
   // #68 delivered the STATIC half (shallow scan + mirror + prompt index). The
@@ -3060,7 +2892,7 @@ export async function apply(ctx, config) {
         if (!rawPath) return
         const cwd = agent.session.header && agent.session.header.cwd
         if (!cwd) return
-        const { remotePath, machine, mirrorDir, mapping } = resolveMirrorForLocal(String(cwd))
+        const { remotePath, machine } = sessionWorkspace(cwd)
         if (!remotePath || !machine) return // a LOCAL session: the core owns it
         const touched = normalizeRemotePath(rawPath)
         // Reading the workspace root itself adds no chain (the core's baseline
@@ -3074,7 +2906,7 @@ export async function apply(ctx, config) {
         // against a short-lived SFTP surface and any failure is swallowed.
         const sftp = await pool.sftp()
         const { items, removed } = await refreshTouched({
-          sftp, remoteRoot: remotePath, touched, mirrorDir: mapping ? null : mirrorDir, tracker: instructionTracker, sessionId,
+          sftp, remoteRoot: remotePath, touched, mirrorDir: null, tracker: instructionTracker, sessionId,
         })
         if (!items.length && !removed.length) return
         const platform = pool.platform
@@ -3469,14 +3301,6 @@ export async function apply(ctx, config) {
     // alone, so a fresh registry stays "no choice yet" (not an
     // explicit none) and a previously-cleared registry stays cleared.
     saveMachines(machines, store.currentId, false)
-    // Issue #67: an EDITED connection identity (host/user/port) must
-    // carry the machine's existing workspaces over — without this the
-    // mirrors stayed bound to the old address and the user had to
-    // create (and re-sync) a brand-new workspace for the new IP.
-    let reboundMirrors = 0
-    if (i >= 0 && prev) {
-      try { reboundMirrors = rebindMirrors(prev, rec) } catch { /* best effort */ }
-    }
     // Issue #50: host/user/port/key have ONE home — ~/.ssh/config.
     // Saving a literal machine upserts a marker-tagged Host block,
     // so the file and the registry can never drift; the record's
@@ -3517,7 +3341,6 @@ export async function apply(ctx, config) {
       machine: sanitizeMachine(rec),
       machines: machinesForClient(),
       currentId: store.currentId,
-      ...(reboundMirrors ? { reboundMirrors } : {}),
       ...(warning ? { warning, warningDetail } : {}),
       ...(sshConfigWarning ? { sshConfigWarning } : {}),
     }
@@ -3688,40 +3511,33 @@ export async function apply(ctx, config) {
 
   /** Resolve a machine for the API: by id when given, else the ACTIVE machine
    *  (explicit current > ephemeral > config default, exactly like status()).
-   *  Returns the RESOLVED connect identity — ssh-config aliases expanded, and
-   *  folded back to the alias for the system-OpenSSH backend (which dials the
-   *  alias itself), i.e. what applyActiveMachine writes into the shared config. */
+   *  Returns the resolved identity so a new workspace can pin it. */
   const resolveMachineForApi = (machineId) => {
     const id = String(machineId || '').trim()
     if (id) {
       const i = machineIndex(id)
       if (i < 0) throw codedError('MACHINE_NOT_FOUND', `machine not found: ${id}`)
       const rec = machines[i]
-      const eff = withSshConfig(rec)
-      const t = connectTargetFor(eff)
       return {
+        ...identityOf(rec),
         record: rec,
         machineId: rec.id,
         name: String(rec.name || rec.host || ''),
-        host: String(t.aliasNative ? t.host : (eff.host || '')),
-        port: t.aliasNative ? 22 : (Number(eff.port) || 22),
-        username: t.aliasNative ? '' : String(eff.username || ''),
-        alias: aliasOf(eff),
+        alias: aliasOf(rec),
       }
     }
-    const rec = store.currentId && machineIndex(store.currentId) >= 0 ? machines[machineIndex(store.currentId)] : null
+    const rec = !ephemeral && store.currentId && machineIndex(store.currentId) >= 0 ? machines[machineIndex(store.currentId)] : null
     const m = activeMachine()
     if (!m || !m.host) {
       throw codedError('NO_ACTIVE_MACHINE', '当前没有活动远程机：请先在「远程工作区」设置里选择或连接一台机器。（保存的机器只是备用连接，不会自动成为当前机器。）')
     }
-    const t = connectTargetFor(m)
     return {
       record: rec,
       machineId: rec ? rec.id : '',
       name: String((rec && rec.name) || m.name || m.host || ''),
-      host: String(t.aliasNative ? t.host : (m.host || '')),
-      port: t.aliasNative ? 22 : (Number(m.port) || 22),
-      username: t.aliasNative ? '' : String(m.username || ''),
+      host: String(m.host || ''),
+      port: Number(m.port) || 22,
+      username: String(m.username || ''),
       alias: aliasOf(m),
     }
   }
@@ -3735,7 +3551,7 @@ export async function apply(ctx, config) {
       const m = resolveMachineForApi(id)
       // The per-machine pool keeps browsing off the shared active pool: a
       // directory listing must never switch the user's current machine.
-      const targetPool = poolForMachine({ host: m.host, port: m.port, username: m.username, alias: m.alias })
+      const targetPool = poolForMachine(m)
       const tgt = (targetPool && targetPool.config) || {}
       return {
         pool: targetPool,
@@ -3776,10 +3592,7 @@ export async function apply(ctx, config) {
 
   /** Every local mirror + the registry machine its meta resolves to. Pure
    *  filesystem read (mirrorRegistry), so it never dials. */
-  const listRemoteProjectsForApi = () => mirrorRegistry().map((p) => {
-    const rec = machineRecordFor({ host: p.host, port: p.port, username: p.username, alias: p.alias })
-    return { ...p, machineId: rec && rec.id ? String(rec.id) : null }
-  })
+  const listRemoteProjectsForApi = () => mirrorRegistry()
 
   /** SSH `stat` validation used by pickRemoteWorkspace. With a machineId it
    *  runs on that machine's OWN pool (validation must not switch the active
@@ -3788,7 +3601,7 @@ export async function apply(ctx, config) {
     const id = String(machineId || '').trim()
     if (id) {
       const m = resolveMachineForApi(id)
-      return isRemoteDir(remotePath, poolForMachine({ host: m.host, port: m.port, username: m.username, alias: m.alias }))
+      return isRemoteDir(remotePath, poolForMachine({ ...m, pinned: true }))
     }
     if (!String(config.host || '').trim()) {
       const m = activeMachine()
@@ -3861,9 +3674,6 @@ export async function apply(ctx, config) {
   }
 
 
-  // Mapped checkouts use the existing opt-in watcher on subsequent edits.
-  for (const view of mappedWorkspaceViews()) startAutoPush(view.dir)
-
   // ── route helpers ─────────────────────────────────────────────────────────
   const routes = [
     {
@@ -3877,14 +3687,20 @@ export async function apply(ctx, config) {
           // sessionMode reflects THAT session's cwd, not the machine default.
           if (!sessionId) return sendJson(res, 200, status())
           const cwd = sessionCwd(sessionId)
-          const resolved = cwd ? resolveMirrorForLocal(cwd) : { remotePath: '', machine: null }
+          if (!cwd) return sendJson(res, 404, { error: 'Could not resolve the requested session workspace.' })
+          const resolved = sessionWorkspace(cwd)
+          if (resolved.broken) return sendJson(res, 409, { error: 'The remote workspace binding is missing or invalid.' })
           const extra = {
             sessionMode: resolved.remotePath ? 'remote' : 'local',
             sessionRemotePath: resolved.remotePath || '',
             sessionBound: !!(resolved.machine && resolved.remotePath),
           }
           if (resolved.machine && resolved.remotePath) {
-            const p = poolForMachine(resolved.machine)
+            let p
+            try { p = poolForMachine(resolved.machine) } catch (error) {
+              return sendJson(res, error.httpStatus || 500, { error: error.message })
+            }
+            extra.localMirror = resolved.mirrorDir
             extra.host = resolved.machine.host
             extra.username = resolved.machine.username
             extra.port = resolved.machine.port
@@ -3913,54 +3729,15 @@ export async function apply(ctx, config) {
         if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' })
         try {
           const q = new URL(req.url, 'http://localhost').searchParams
-          let local = q.get('local') ? decodeURIComponent(q.get('local')) : ''
-          const sessionId = q.get('sessionId') ? decodeURIComponent(q.get('sessionId')) : ''
-          let resolvedVia = 'query'
-          if (!local && sessionId) {
-            // 1) Live in-memory session header (active sessions only).
-            try {
-              const sessions = ctx && typeof ctx.get === 'function' ? ctx.get('sessions') : null
-              const session = sessions && typeof sessions.get === 'function' ? sessions.get(sessionId) : null
-              const header = session && session.header ? session.header : null
-              if (header && header.cwd) {
-                local = String(header.cwd)
-                resolvedVia = 'session'
-              }
-            } catch { /* sessions service unavailable */ }
-            // 2) Durable session log header (works for historical sessions too):
-            //    walk $DSH_HOME/sessions/<projectKey>/<sessionId>/session.jsonl.zstd
-            //    and read the header line (first zstd frame) for cwd.
-            if (!local) {
-              try {
-                const sessionsRoot = path.join(dshBase(), 'sessions')
-                if (existsSync(sessionsRoot)) {
-                  const targetDir = encodeSegmentSafe(sessionId)
-                  for (const projDir of readdirSync(sessionsRoot)) {
-                    const projPath = path.join(sessionsRoot, projDir)
-                    if (!statSync(projPath, { throwIfNoEntry: false })?.isDirectory?.()) continue
-                    const sessDir = path.join(projPath, targetDir)
-                    if (!statSync(sessDir, { throwIfNoEntry: false })?.isDirectory?.()) continue
-                    const logFile = ['session.jsonl.zstd', 'session.jsonl', 'session.jsonl.gz'].map((n) => path.join(sessDir, n)).find((p) => existsSync(p))
-                    if (!logFile) continue
-                    const cwd = readSessionHeaderCwd(logFile)
-                    if (cwd) {
-                      local = cwd
-                      resolvedVia = 'session-log'
-                      break
-                    }
-                  }
-                }
-              } catch { /* session log scan failed */ }
-            }
-          }
-          const { remotePath, mirrorDir } = resolveMirrorForLocal(local)
+          const sessionId = q.get('sessionId') || ''
+          const local = sessionId ? sessionCwd(sessionId) : (q.get('local') || '')
+          if (sessionId && !local) return sendJson(res, 404, { error: 'Could not resolve the requested session workspace.' })
+          const { remotePath, mirrorDir, broken } = sessionWorkspace(local)
+          if (broken) return sendJson(res, 409, { error: 'The remote workspace binding is missing or invalid.' })
           return sendJson(res, 200, {
-            local, remotePath, mirrorDir,
-            // `fallback:true` now means "this session is NOT a remote session"
-            // (used to mean "fell back to machine workspace").
-            fallback: !remotePath,
+            local, remotePath, mirrorDir, fallback: !remotePath,
             mode: remotePath ? 'remote' : 'local',
-            resolvedVia,
+            resolvedVia: sessionId ? 'session' : 'query',
           })
         } catch (err) {
           return sendJson(res, 500, { error: String((err && err.message) || err) })
@@ -3982,7 +3759,7 @@ export async function apply(ctx, config) {
       handler: async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' })
         try {
-          return sendJson(res, 200, { mirrors: [...mirrorRegistry(), ...mappedWorkspaceViews()] })
+          return sendJson(res, 200, { mirrors: mirrorRegistry() })
         } catch (err) {
           return sendJson(res, 500, { error: String((err && err.message) || err) })
         }
@@ -4047,11 +3824,9 @@ export async function apply(ctx, config) {
           if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
           const body = parseJsonObject(await readBody(req))
           if (body.action === 'remove') {
-            const previous = readMappings(root).find(record => record.id === body.id)
             if (!removeMapping(root, body.id, body.revision)) {
               return sendJson(res, 409, { error: 'The mapping changed. Reload and try again.' })
             }
-            stopAutoPush(previous.localPath)
             return sendJson(res, 200, { ok: true })
           }
           if (body.action !== 'save') return sendJson(res, 400, { error: 'action must be save or remove' })
@@ -4062,10 +3837,9 @@ export async function apply(ctx, config) {
           const machineId = typeof body.machineId === 'string' ? body.machineId : ''
           const record = machines[machineIndex(machineId)]
           if (!record) return sendJson(res, 404, { error: 'Select a saved SSH server' })
-          const previous = readMappings(root).find(item => item.id === body.id)
           const localPath = localDirectory(body.localPath)
           const remotePath = normalizeRemotePath(remote)
-          const target = { ...identityOf(record), alias: aliasOf(record), machineId }
+          const target = { ...identityOf(record), alias: aliasOf(record), machineId, pinned: true }
           if (!(await isRemoteDir(remotePath, poolForMachine(target)))) {
             return sendJson(res, 400, { error: 'Remote directory does not exist or could not be reached' })
           }
@@ -4075,8 +3849,6 @@ export async function apply(ctx, config) {
           const { mapping, conflict, replaceable, stale } = saveMapping(root, { ...body, machineId, localPath, remotePath })
           if (stale) return sendJson(res, 409, { error: 'The mapping changed. Reload and try again.' })
           if (conflict) return sendJson(res, 409, { error: 'This local directory overlaps an existing mapping', conflict, replaceable })
-          if (previous && previous.revision !== mapping.revision) stopAutoPush(previous.localPath)
-          startAutoPush(mapping.localPath)
           return sendJson(res, 200, { ok: true, mapping })
         } catch (error) {
           return sendJson(res, 400, { ok: false, error: String(error.message || error) })
@@ -4099,8 +3871,7 @@ export async function apply(ctx, config) {
           if (!okDir) return sendJson(res, 400, { ok: false, error: `not a directory: ${p}` })
           persistWorkspace(p)
           const local = ensureMirror(p, config.host, config.username, config.port, { alias: aliasOf(activeMachine()) })
-          startAutoPush(local)
-          return sendJson(res, 200, { ok: true, workspace: p, localMirror: local, ...status() })
+          return sendJson(res, 200, { ...status(), ok: true, workspace: p, localMirror: local })
         } catch (err) {
           return sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
         }
@@ -4118,28 +3889,57 @@ export async function apply(ctx, config) {
           const rawPath = String(payload.path || '').trim()
           if (!rawPath) return sendJson(res, 400, { ok: false, error: 'path must be an absolute directory' })
           const p = normalizeRemotePath(rawPath)
-          if (!config.host) return sendJson(res, 400, { ok: false, error: 'no remote host configured/connected — connect first' })
-          // The picker names the machine it was browsing. Re-assert it so a
-          // switch made elsewhere between the listing and this commit cannot
-          // mirror onto a machine the user never looked at (the picker sends
-          // /current only once per machine now, so nothing else re-applies it).
-          if (!(await applyRequestedMachine(payload, res))) return
-          const okDir = await isRemoteDir(p)
-          if (!okDir) return sendJson(res, 400, { ok: false, error: `not a directory (or unreachable): ${p}` })
-          const local = ensureMirror(p, config.host, config.username, config.port, { alias: aliasOf(activeMachine()) })
-          persistWorkspace(p)
-          startAutoPush(local)
-          // The native "Add workspace" picker adopts the mirror right after this
-          // response (`workspace.create({ path: localMirror })`). Registering it
-          // here first is the only way to influence the title, because the core
-          // Create API takes no title and would derive "xdfs" from the mirror's
-          // last segment. Callers that only pick a folder (settings page, Remote
-          // Files explorer) opt out with registerWorkspace:false, so no stray
-          // workspace appears in their flow.
-          if (payload.registerWorkspace !== false) await registerMirroredWorkspace(local, p, activeMachine())
-          return sendJson(res, 200, { ok: true, path: p, localMirror: local, ...status() })
+          const root = remoteWorkspacesRoot()
+          const mapping = payload.mappingId && readMappings(root).find(item => item.id === payload.mappingId)
+          if (payload.mappingId && (!mapping || mapping.revision !== payload.mappingRevision
+            || mapping.remotePath !== p || mapping.machineId !== payload.machineId)) {
+            return sendJson(res, 409, { error: 'The directory mapping changed. Choose the workspace again.' })
+          }
+          const id = String(payload.machineId || '')
+          const record = id ? machines[machineIndex(id)] : activeMachine()
+          if (!record?.host) return sendJson(res, 404, { error: 'Choose an available remote server.' })
+          const identity = id ? identityOf(record) : { host: record.host, port: Number(record.port) || 22, username: record.username || '' }
+          const target = { ...identity, alias: aliasOf(record), machineId: id || (machines.includes(record) ? record.id : ''), pinned: !!id }
+          if (!(await isRemoteDir(p, id ? poolForMachine(target) : pool))) {
+            return sendJson(res, 400, { error: 'The remote directory does not exist or could not be reached.' })
+          }
+          if ((id && (machines[machineIndex(id)] !== record || !identityMatches(record, target)))
+            || (!id && poolKey(activeMachine()) !== poolKey(target))) {
+            return sendJson(res, 409, { error: 'The selected SSH target changed. Choose the workspace again.' })
+          }
+          if (mapping && !readMappings(root).some(item => item.id === mapping.id && item.revision === mapping.revision)) {
+            return sendJson(res, 409, { error: 'The directory mapping changed. Choose the workspace again.' })
+          }
+          const local = ensureMirror(p, target.host, target.username, target.port, { ...target, mapping })
+          if (!id || store.currentId === id) persistWorkspace(p)
+          if (payload.registerWorkspace !== false) await registerMirroredWorkspace(local, p, record)
+          return sendJson(res, 200, { ...status(), ok: true, path: p, localMirror: local, mirrorDir: mapping?.localPath || local })
         } catch (err) {
           return sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: '/dsh-remote/sync-workspace',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+        try {
+          const { sessionId, direction } = parseJsonObject(await readBody(req))
+          const operation = direction === 'pull' ? 'rw_sync' : direction === 'push' ? 'rw_push' : ''
+          if (!operation || typeof sessionId !== 'string' || !sessionId) {
+            return sendJson(res, 400, { error: 'Choose a remote session and a sync direction.' })
+          }
+          const cwd = sessionCwd(sessionId)
+          if (!cwd) return sendJson(res, 404, { error: 'Could not resolve the requested session workspace.' })
+          const session = sessionsSvc()?.get?.(sessionId) || { id: sessionId, header: { cwd } }
+          const exec = { agent: { session } }
+          const b = requireBinding(exec, operation)
+          if (direction === 'push') requireRemoteSandbox(exec, 'write', { tool: operation, path: b.ws })
+          const result = await tools.find(tool => tool.name === operation).execute({}, exec)
+          return sendJson(res, 200, { ok: true, text: result.text })
+        } catch (error) {
+          return sendJson(res, error.httpStatus || 500, { error: error.message })
         }
       },
     },
@@ -4650,7 +4450,7 @@ export async function apply(ctx, config) {
         return
       }
       try {
-        mod.installTui(ctx, hostApi, config, resolveMirrorForLocal)
+        mod.installTui(ctx, hostApi, config, sessionWorkspace)
       } catch (err) {
         hostLog('warn', `[dsh-remote] TUI layer failed to install: ${String((err && err.message) || err)}`)
       }

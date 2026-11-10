@@ -107,7 +107,7 @@ export function mountClient(opts = {}) {
   const run = new Function(
     'window', 'document', 'navigator', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'console', 'fetch', 'require', `${CLIENT_SRC}\n//# sourceURL=lib/client.js`,
   )
-  run(sandbox.window, sandbox.document, sandbox.navigator, setTimeout, clearTimeout, setIntervalStub, clearIntervalStub, console, fetchStub, requireStub)
+  run(sandbox.window, sandbox.document, sandbox.navigator, timers.setTimeout, timers.clearTimeout, setIntervalStub, clearIntervalStub, console, fetchStub, requireStub)
 
   const mod = loaded.factory(requireStub)
   const registered = new Map()

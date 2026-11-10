@@ -144,7 +144,7 @@ test('an empty server list can add its first machine, edit it, and open mapping 
   }
 })
 
-test('remote picker opens the chosen local checkout when mapping is enabled', async () => {
+test('remote picker opens a remote workspace anchor for the chosen checkout', async () => {
   const requests = []
   const picked = []
   const ui = mountClient({ fetch: async (url, opts) => {
@@ -156,6 +156,10 @@ test('remote picker opens the chosen local checkout when mapping is enabled', as
     if (route.endsWith('/mappings')) {
       requests.push(JSON.parse(opts.body))
       return response({ ok: true, mapping: mappings[0] })
+    }
+    if (route.endsWith('/mirror')) {
+      requests.push(JSON.parse(opts.body))
+      return response({ ok: true, path: mappings[0].remotePath, localMirror: 'D:\\dsh\\remote-workspaces\\dev\\api-mapped' })
     }
     throw new Error('unexpected request: ' + url)
   } })
@@ -178,8 +182,67 @@ test('remote picker opens the chosen local checkout when mapping is enabled', as
     tree = await render()
     ui.button(tree, /^设为远程工作区$/).el.props.onClick()
     await ui.tick()
-    assert.deepEqual(requests, [{ machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' }])
-    assert.deepEqual(picked, [[mappings[0].localPath, mappings[0].remotePath]])
+    assert.deepEqual(requests, [
+      { machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' },
+      { machineId: 'dev', path: mappings[0].remotePath, mappingId: 'a', mappingRevision: '1', registerWorkspace: true },
+    ])
+    assert.deepEqual(picked, [['D:\\dsh\\remote-workspaces\\dev\\api-mapped', mappings[0].remotePath]])
+  } finally {
+    ui.dispose()
+  }
+})
+
+test('remote paths are typed or selected through Browse', async () => {
+  const listings = []
+  const submitted = []
+  const picked = []
+  const ui = mountClient({ fetch: async (url, opts) => {
+    const request = new URL(url, 'http://localhost')
+    if (request.pathname.endsWith('/machines')) {
+      return response({ machines: [{ ...machine, recentWorkspaces: ['/recent-project'] }], currentId: 'dev' })
+    }
+    if (request.pathname.endsWith('/ssh-config')) return response({ entries: [] })
+    if (request.pathname.endsWith('/current')) return response({ ok: true })
+    if (request.pathname.endsWith('/bindings')) return response({ mirrors: [] })
+    if (request.pathname.endsWith('/ls')) {
+      const path = request.searchParams.get('path')
+      listings.push(path)
+      return response({ path: path || '/', items: [], platform: 'posix' })
+    }
+    if (request.pathname.endsWith('/mirror')) {
+      const { path } = JSON.parse(opts.body)
+      submitted.push(path)
+      return response({ path, localMirror: '/workspace' })
+    }
+    throw new Error('unexpected request: ' + url)
+  } })
+  try {
+    const picker = ui.component('sidebar.workspaces.directoryFlow')
+    const props = { open: true, onPicked: (...args) => picked.push(args), onCancel() {} }
+    const render = () => ui.settleComponent(picker, props)
+    const input = tree => ui.inputs(tree).find(field => field.placeholder === '输入远程路径')
+    let tree = await render()
+    ui.button(tree, /^远程$/).el.props.onClick()
+    tree = await render()
+    assert.doesNotMatch(ui.text(tree), /最近:|主目录|recent-project/)
+    assert.equal(input(tree).autoComplete, 'off')
+
+    input(tree).onChange({ target: { value: '/projects/alpha' } })
+    ui.timers.flush(1000)
+    await ui.tick()
+    tree = await render()
+    assert.deepEqual(listings, [])
+    input(tree).onKeyDown({ key: 'Enter', preventDefault() {} })
+    await ui.tick()
+    assert.deepEqual(submitted, ['/projects/alpha'])
+    assert.deepEqual(picked, [['/workspace', '/projects/alpha']])
+
+    ui.button(await render(), /^浏览…$/).el.props.onClick()
+    await ui.tick()
+    tree = await render()
+    assert.deepEqual(listings, ['/projects/alpha'])
+    ui.button(tree, /^选用此路径$/).el.props.onClick()
+    assert.equal(input(await render()).value, '/projects/alpha')
   } finally {
     ui.dispose()
   }

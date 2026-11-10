@@ -117,7 +117,7 @@ export async function createHost({ machines = [], currentId = null, config = {},
         return () => tools.delete(tool.name)
       },
     },
-    systemPrompt: { section: (s) => sections.push(s) },
+    systemPrompt: services.systemPrompt ?? { section: (s) => sections.push(s) },
     on(event, fn) {
       if (!listeners.has(event)) listeners.set(event, [])
       listeners.get(event).push(fn)

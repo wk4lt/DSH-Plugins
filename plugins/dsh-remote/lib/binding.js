@@ -20,21 +20,16 @@ const norm = (p) => path.resolve(String(p || '')).replace(/[\\/]+$/, '') || ''
 
 /** Whether `base` is `dir` itself or nested under it (separator-aware, so
  *  `/a/mirror-2` is NOT treated as living inside `/a/mirror`). */
-const isUnder = (base, dir) => base === dir || base.startsWith(dir + path.sep) || base.startsWith(dir + '/')
+const isUnder = (base, dir) => {
+  const relative = path.relative(dir, base)
+  return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)
+}
 
 /**
- * Resolve which remote workspace a LOCAL path belongs to by scanning the mirror
- * registry for the mirror that contains it.
- *
- * Mirrors live exactly one level under the registry root as
- * `<host>-<user>-<port>/<basename>`, and `mirrorDirFor()` appends a short hash
- * when two remote paths share a basename, so containment is unambiguous. The
- * longest containing path still wins, which keeps the result stable if a
- * future layout ever nests them.
- *
- * A mirror whose meta is missing, unparsable, or has no `host` is skipped
- * rather than guessed at: reporting no binding makes the caller refuse loudly,
- * while guessing would send commands to an unintended host.
+ * Resolve a local session path via its managed anchor under
+ * `<host>-<user>-<port>/<workspace>`. A mapped checkout lives separately from
+ * that anchor. Missing or invalid metadata inside the managed root is a broken
+ * binding, so remote callers can report the problem and stop.
  *
  * @param {string} local - absolute local path, typically a session's cwd.
  * @param {string} root - the mirror registry root (`$DSH_HOME/remote-workspaces`).
@@ -45,51 +40,35 @@ const isUnder = (base, dir) => base === dir || base.startsWith(dir + path.sep) |
  *   empty too).
  */
 export function resolveMirror(local, root) {
-  let mirrorDir = null
-  let remotePath = ''
-  let machine = null
-  if (!local || !root || !existsSync(root)) return { mirrorDir, remotePath, machine }
+  const empty = { mirrorDir: null, remotePath: '', machine: null }
+  if (!local || !root) return empty
   const base = norm(local)
-  let hostDirs
+  const rootDir = norm(root)
+  if (base === rootDir || !isUnder(base, rootDir)) return empty
+
+  // Managed mirrors have two components under the registry root. This
+  // remains true for mapped workspace anchors and for legacy mirrors.
+  const [hostDir, workspaceDir] = path.relative(rootDir, base).split(path.sep)
+  const broken = { ...empty, broken: true }
+  if (!workspaceDir) return broken
+  const anchorDir = path.join(rootDir, hostDir, workspaceDir)
   try {
-    hostDirs = readdirSync(root)
+    const meta = JSON.parse(readFileSync(path.join(anchorDir, '.dsh-remote-meta.json'), 'utf8'))
+    if (!meta?.host || !meta.remotePath) return broken
+    const mapping = meta.mapping
+    if (mapping && (!path.isAbsolute(mapping.localPath || '') || mapping.remotePath !== meta.remotePath
+      || mapping.machineId !== meta.machineId || !mapping.id || !mapping.revision)) return broken
+    return {
+      anchorDir, mirrorDir: mapping?.localPath || anchorDir, mapping,
+      remotePath: String(meta.remotePath),
+      machine: {
+        host: String(meta.host), port: Number(meta.port) || 22, username: String(meta.username || ''),
+        alias: String(meta.alias || ''), machineId: String(meta.machineId || ''), pinned: true,
+      },
+    }
   } catch {
-    return { mirrorDir, remotePath, machine }
+    return broken
   }
-  for (const hostDir of hostDirs) {
-    const hostPath = path.join(root, hostDir)
-    if (!statSync(hostPath, { throwIfNoEntry: false })?.isDirectory?.()) continue
-    let entries
-    try {
-      entries = readdirSync(hostPath)
-    } catch {
-      continue
-    }
-    for (const entry of entries) {
-      const metaPath = path.join(hostPath, entry, '.dsh-remote-meta.json')
-      if (!existsSync(metaPath)) continue
-      const mirrorAbs = norm(path.join(hostPath, entry))
-      if (!isUnder(base, mirrorAbs)) continue
-      // Deepest match wins; an equal-length path cannot occur twice.
-      if (mirrorDir && mirrorAbs.length <= mirrorDir.length) continue
-      try {
-        const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-        if (!meta || !meta.host) continue
-        mirrorDir = mirrorAbs
-        remotePath = String(meta.remotePath || '')
-        machine = {
-          host: String(meta.host),
-          port: Number(meta.port) || 22,
-          username: String(meta.username || ''),
-          // The ~/.ssh/config alias this mirror was created through, when the
-          // machine was saved as one (issue #38): it keeps the mirror bound to
-          // its machine even if that alias's HostName/port later change.
-          alias: String(meta.alias || ''),
-        }
-      } catch { /* unparsable meta → not a usable binding */ }
-    }
-  }
-  return { mirrorDir, remotePath, machine }
 }
 
 /**
@@ -147,7 +126,7 @@ export function lookupSessionCwd(sessionId, { sessions, dshHome } = {}) {
       if (!statSync(projPath, { throwIfNoEntry: false })?.isDirectory?.()) continue
       const sessDir = path.join(projPath, targetDir)
       if (!statSync(sessDir, { throwIfNoEntry: false })?.isDirectory?.()) continue
-      const logFile = ['session.jsonl.zstd', 'session.jsonl', 'session.jsonl.gz']
+      const logFile = ['session.v4.jsonl.zstd', 'session.jsonl.zstd', 'session.jsonl', 'session.jsonl.gz']
         .map((n) => path.join(sessDir, n)).find((p) => existsSync(p))
       if (!logFile) continue
       const cwd = readSessionHeaderCwd(logFile)
