@@ -275,12 +275,10 @@ window.__ModuleLoader__.load({
         'picker.sshConfigMachines': 'SSH 配置中的主机',
         'picker.machineListFailed': '读取远程机器失败：{msg}',
         'picker.importMachineFailed': '无法添加 SSH 主机 {alias}',
-        'picker.recent': '最近:',
-        'picker.pathPlaceholder': '输入远程路径（自动补全）',
-        'picker.pathPlaceholderWin': '输入远程路径，如 C:\\Users\\…（自动补全）',
+        'picker.pathPlaceholder': '输入远程路径',
+        'picker.pathPlaceholderWin': '输入远程路径，如 C:\\Users\\…',
         'picker.chooseMachineFirst': '先选远程机器',
         'picker.browse': '浏览…',
-        'picker.home': '~ 主目录',
         'picker.setRemoteWs': '设为远程工作区',
         'picker.mirroring': '镜像中…',
         'picker.cancel': '取消',
@@ -307,7 +305,6 @@ window.__ModuleLoader__.load({
         'picker.noSysPickerHost': '当前系统不支持自动打开目录选择器，请在输入框直接填本地路径',
         'picker.noHomeWin': 'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径',
         'picker.typePath': ' — 可直接在输入框填本地路径',
-        'picker.noHome': '无法解析主目录',
         'picker.newDirName': '新建目录名（在 {path} 下）',
         'picker.invalidDirName': '请输入单个目录名，不能包含路径分隔符',
         'picker.mkdirParentRequired': '请先进入要创建子目录的远程目录',
@@ -561,12 +558,10 @@ window.__ModuleLoader__.load({
         'picker.sshConfigMachines': 'Hosts from SSH config',
         'picker.machineListFailed': 'Could not load remote machines: {msg}',
         'picker.importMachineFailed': 'Could not add SSH host {alias}',
-        'picker.recent': 'Recent:',
-        'picker.pathPlaceholder': 'Enter remote path (auto-complete)',
-        'picker.pathPlaceholderWin': 'Enter remote path, e.g. C:\\Users\\… (auto-complete)',
+        'picker.pathPlaceholder': 'Enter remote path',
+        'picker.pathPlaceholderWin': 'Enter remote path, e.g. C:\\Users\\…',
         'picker.chooseMachineFirst': 'Choose a remote machine first',
         'picker.browse': 'Browse…',
-        'picker.home': '~ Home',
         'picker.setRemoteWs': 'Set as remote workspace',
         'picker.mirroring': 'Mirroring…',
         'picker.cancel': 'Cancel',
@@ -593,7 +588,6 @@ window.__ModuleLoader__.load({
         'picker.noSysPickerHost': 'This system cannot auto-open a directory picker — type a local path in the input box',
         'picker.noHomeWin': 'Windows remotes do not support ~ resolution — enter an absolute path',
         'picker.typePath': ' — type a local path in the input box instead',
-        'picker.noHome': 'Cannot resolve home directory',
         'picker.newDirName': 'New directory name (under {path})',
         'picker.invalidDirName': 'Enter a single directory name without path separators',
         'picker.mkdirParentRequired': 'Open a remote directory before creating a subdirectory',
@@ -875,11 +869,8 @@ window.__ModuleLoader__.load({
      *
      * `click` is dispatched on the nearest common ancestor of the mousedown and
      * mouseup targets. A gesture that pressed an element INSIDE the panel and
-     * released on the backdrop — because the panel re-laid-out mid-gesture (the
-     * remote autocomplete list used to sit in document flow, so expanding it
-     * pushed a centred panel's edges out from under the pointer) — is therefore
-     * reported as a click ON THE BACKDROP, and a bare `onClick` closed the whole
-     * dialog. Selecting a suggestion kicked the user out of the picker.
+     * released on the backdrop can therefore be reported as a click on the
+     * backdrop, even when the press began inside the dialog.
      *
      * Guarding on the press origin keeps "click outside to dismiss" while a
      * drag that merely ENDS outside can no longer dismiss anything. The panel's
@@ -1518,52 +1509,22 @@ window.__ModuleLoader__.load({
       const [importingMachine, setImportingMachine] = React.useState(false)
       const [machineId, setMachineId] = React.useState('')
       const [path, setPath] = React.useState('')
-      const [items, setItems] = React.useState(null)
       const [err, setErr] = React.useState('')
       const [loading, setLoading] = React.useState(false)
       const [levels, setLevels] = React.useState(null)
       const [popOpen, setPopOpen] = React.useState(false)
-      const [suggest, setSuggest] = React.useState([])
-      const [suggestOpen, setSuggestOpen] = React.useState(false)
-      const [recent, setRecent] = React.useState([])
       const [win, setWin] = React.useState(false) // remote platform: windows = Git-Bash host
       // 本机浏览浮层（browse 后端）：{ path, home, crumbs, entries, truncated }。
       const [localPop, setLocalPop] = React.useState(null)
       const [newDirName, setNewDirName] = React.useState('')
       const [mkdirPrompt, setMkdirPrompt] = React.useState(false)
-      const suggestTimer = React.useRef(null)
-      const suggestRef = React.useRef(null)
       const pickerSessionRef = React.useRef(null)
       const levelsSeqRef = React.useRef(0)
-      // Issue #52 defect 1: the modal backdrop must dismiss only when the press
-      // STARTED on it (a suggestion click whose mouseup landed on the backdrop
-      // used to close the whole picker). The local-browse popup below is its own
-      // full-screen overlay, so it gets its own guard ref — sharing one ref
-      // would make a press on either backdrop arm the other.
+      // The picker and local browser each guard their own backdrop presses.
       const backdrop = useBackdropGuard()
       const localBackdrop = useBackdropGuard()
-      // Autocomplete performance (slow per-keystroke remote scans):
-      //  - postedCurrentRef/currentPromiseRef: POST /current once per machine
-      //    switch; concurrent callers share ONE in-flight promise and a failed
-      //    switch REJECTS (never run /ls — or cache its listing — on the wrong
-      //    machine)
-      //  - lsCacheRef/lsInflightRef: one /ls per (machine, dir), TTL-cached
-      //  - lsGenRef/fetchSeqRef: per-key fetch generation — a cache write from
-      //    a superseded fetch (fresh navigation, picker reopen) is dropped
-      //  - suggestSeqRef: drop stale suggestion responses (older keystrokes)
       const postedCurrentRef = React.useRef('')
       const currentPromiseRef = React.useRef(null)
-      const lsCacheRef = React.useRef(new Map())
-      const lsInflightRef = React.useRef(new Map())
-      const lsGenRef = React.useRef(new Map())
-      const fetchSeqRef = React.useRef(0)
-      const suggestSeqRef = React.useRef(0)
-      React.useEffect(() => {
-        if (!suggestOpen) return
-        const onDown = (ev) => { if (suggestRef.current && !suggestRef.current.contains(ev.target)) killSuggestions() }
-        document.addEventListener('mousedown', onDown)
-        return () => document.removeEventListener('mousedown', onDown)
-      }, [suggestOpen])
       React.useEffect(() => { if (open) ensureChromeCss() }, [open])
 
       const sortItems = (list) => {
@@ -1601,13 +1562,7 @@ window.__ModuleLoader__.load({
         return cands.some((c) => c.host === String(echo.host) && c.port === (Number(echo.port) || 22) && c.username === String(echo.username || ''))
       }
 
-      // POST /current once per machine switch. The picker used to post it before
-      // EVERY /ls; the host re-applies the machine on that route, which used to
-      // close the live SSH connection — so each autocomplete keystroke paid a
-      // full reconnect. The memo is set only on SUCCESS and concurrent callers
-      // share ONE in-flight promise, so no request can overtake a pending switch
-      // and read the OLD machine's listing. A failed switch REJECTS: the
-      // caller's fetch chain aborts WITHOUT writing the cache.
+      // Activate each machine once and serialize switches before browsing.
       const ensureCurrent = (id) => {
         if (!id) return Promise.resolve()
         if (postedCurrentRef.current === id) return Promise.resolve()
@@ -1628,79 +1583,29 @@ window.__ModuleLoader__.load({
         return p
       }
 
-      const LS_TTL_MS = 30000
-      // Cached remote listing per (machine, dir): typing inside one parent
-      // directory used to re-fetch the identical list on every keystroke.
-      // `fresh` bypasses the cache (browse navigation / post-mkdir refresh) and
-      // SUPERSEDES older fetches for the key: a cache write from a superseded
-      // fetch is dropped (it still resolves its own callers), so a pre-mkdir
-      // listing can never overwrite the post-mkdir one. Concurrent identical
-      // requests share one in-flight fetch.
-      const fetchDirList = (id, dirParam, fresh) => {
-        const key = String(id) + '\u0000' + String(dirParam)
-        const hit = lsCacheRef.current.get(key)
-        if (!fresh && hit && Date.now() - hit.at < LS_TTL_MS) return Promise.resolve(hit.node)
-        const inflight = fresh ? null : lsInflightRef.current.get(key)
-        if (inflight) return inflight
-        const gen = ++fetchSeqRef.current
-        lsGenRef.current.set(key, gen)
-        const toNode = (res) => {
-          const real = typeof res?.path === 'string' ? res.path : String(dirParam)
-          // Server returns [{ type, name, size, mtime, path }] where `path` is
-          // the FULL display-form path (C:\Users\dev on Windows) — the client
-          // never joins paths itself, so drives and Windows paths just work.
-          const list = Array.isArray(res && res.items)
-            ? res.items.map((it) => ({ name: it.name, dir: it.type === 'dir', size: it.size, mtime: it.mtime, path: it.path || joinDisplay(real, it.name), drive: !!it.drive }))
-            : parseLs(res && res.text)
-          return {
-            path: real,
-            platform: !!(res && res.platform === 'windows'),
-            dirs: sortItems(list.filter((it) => it.dir)),
-            all: sortItems(list),
-          }
+      const fetchDirList = async (id, dirParam, retried = false) => {
+        await ensureCurrent(id)
+        const res = await api('GET', '/dsh-remote/ls?' + new URLSearchParams({ path: dirParam, machineId: id }))
+        if (!retried && !echoMatches(id, res?.machine)) {
+          postedCurrentRef.current = ''
+          return fetchDirList(id, dirParam, true)
         }
-        const run = (retried) => ensureCurrent(id)
-        .then(() => api('GET', '/dsh-remote/ls?' + new URLSearchParams({ path: dirParam, machineId: id })))
-        .then((res) => {
-          // External-switch defense: on an identity-echo mismatch the host is
-          // no longer on the machine this fetch intended — bust the memo, force
-          // one re-switch and retry ONCE. A mismatched listing is never cached.
-          if (!echoMatches(id, res && res.machine)) {
-            if (retried) return toNode(res)
-            postedCurrentRef.current = ''
-            return run(true)
-          }
-          const node = toNode(res)
-          if (lsGenRef.current.get(key) === gen) lsCacheRef.current.set(key, { at: Date.now(), node })
-          return node
-        })
-        const p = run(false)
-        .finally(() => { if (lsInflightRef.current.get(key) === p) lsInflightRef.current.delete(key) })
-        lsInflightRef.current.set(key, p)
-        return p
-      }
-
-      // Fresh session on every open: forget everything a previous open left
-      // behind. A stale in-flight response must not repopulate the cache
-      // (generation fence) and a stale suggestion response must not reopen the
-      // dropdown on the now-live tree.
-      const resetPickerFetchState = () => {
-        postedCurrentRef.current = ''
-        lsCacheRef.current.clear()
-        lsInflightRef.current.clear()
-        lsGenRef.current.clear()
-        suggestSeqRef.current++
+        const real = typeof res?.path === 'string' ? res.path : dirParam
+        const list = Array.isArray(res?.items)
+          ? res.items.map(it => ({ name: it.name, dir: it.type === 'dir', size: it.size, mtime: it.mtime, path: it.path || joinDisplay(real, it.name), drive: !!it.drive }))
+          : parseLs(res?.text)
+        return { path: real, platform: res?.platform === 'windows', all: sortItems(list) }
       }
 
       const loadLevels = (id, p, toIndex) => {
         if (!id) return
         const seq = ++levelsSeqRef.current
         setLoading(true); setErr('')
-        fetchDirList(id, p || '', true)
+        fetchDirList(id, p || '')
         .then((node) => {
           if (seq !== levelsSeqRef.current) return
           setWin(node.platform)
-          const level = { path: node.path, dirs: node.dirs, all: node.all }
+          const level = { path: node.path, all: node.all }
           setLevels((prev) => {
             const base = prev && prev.length ? prev.slice() : []
             let idx = typeof toIndex === 'number' && toIndex >= 0 ? toIndex : base.length
@@ -1720,17 +1625,12 @@ window.__ModuleLoader__.load({
         // Bug fix: the picker must NOT reopen with the previous selection's
         // path — reset the path bar (and the browse state) on every open.
         setPath(''); setLevels(null); setWin(false)
-        setErr(''); setLoading(false); setMachineId(''); setRecent([])
+        setErr(''); setLoading(false); setMachineId('')
         setMachineList({ machines: [], sshHosts: [], loading: true, error: '' })
         setImportingMachine(false)
         setMapLocal(false); setMappedPath('')
         setLocalPop(null); setNewDirName(''); setMkdirPrompt(false); setPopOpen(false)
-        // Fresh session: re-post /current on the first request and forget
-        // everything a previous open left behind (TTL bounds staleness within
-        // one open; reopening should see the live tree) — cached AND in-flight
-        // listings, plus any pending suggestion response.
-        resetPickerFetchState()
-        killSuggestions()
+        postedCurrentRef.current = ''
         Promise.allSettled([
           api('GET', '/dsh-remote/machines'),
           api('GET', '/dsh-remote/ssh-config'),
@@ -1744,12 +1644,10 @@ window.__ModuleLoader__.load({
             : saved.find(m => m.id === registry.value?.currentId) || saved[0]
           setMachineList({ machines: saved, sshHosts: entries, loading: false, error })
           setMachineId(selected?.id || '')
-          setRecent(selected?.recentWorkspaces || [])
         })
         return () => {
           pickerSessionRef.current = null
           levelsSeqRef.current++
-          cancelSuggestionRequest()
         }
       }, [open])
 
@@ -1796,16 +1694,10 @@ window.__ModuleLoader__.load({
 
       const switchTab = (t) => {
         if (pickerSessionRef.current?.importing) return
-        killSuggestions()
         closeBrowser()
         setTab(t); setErr('')
         // each tab keeps its own path — never leak the other tab's selection
         setPath('')
-        if (t === 'remote') {
-          // Windows remotes show a "This PC" drive view at the root; POSIX shows
-          // the filesystem root. Either way loadLevels('') lists that root.
-          if (machineId) loadLevels(machineId, '', 0)
-        }
       }
 
       // Parent path of a display-form remote path (client-side, both separators).
@@ -1842,19 +1734,6 @@ window.__ModuleLoader__.load({
         if (par) loadLevels(machineId, par, 1)
       }
 
-      const cancelSuggestionRequest = () => {
-        clearTimeout(suggestTimer.current)
-        suggestTimer.current = null
-        suggestSeqRef.current++
-      }
-
-      // Cancel a queued lookup and ignore any response already in flight.
-      const killSuggestions = () => {
-        cancelSuggestionRequest()
-        setSuggest([])
-        setSuggestOpen(false)
-      }
-
       const closeBrowser = () => {
         if (!popOpen) return
         levelsSeqRef.current++
@@ -1864,7 +1743,6 @@ window.__ModuleLoader__.load({
 
       const openBrowser = () => {
         if (!machineId) return
-        killSuggestions()
         setLevels(null)
         setPopOpen(true)
         loadLevels(machineId, path.trim(), 0)
@@ -1872,11 +1750,9 @@ window.__ModuleLoader__.load({
 
       const selectMachine = machine => {
         levelsSeqRef.current++
-        killSuggestions()
-        setMachineId(machine?.id || ''); setRecent(machine?.recentWorkspaces || [])
+        setMachineId(machine?.id || '')
         setLevels(null); setPath(''); setWin(false); setPopOpen(false); setErr('')
-        if (machine) loadLevels(machine.id, '', 0)
-        else setLoading(false)
+        setLoading(false)
       }
 
       const chooseMachine = async value => {
@@ -1906,72 +1782,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // One seq-guarded "fetch listing → derive suggestion paths" pipeline
-      // shared by loadSuggestions (typing: dirs matching a prefix) and
-      // continueSuggest (expanding a picked dir: all its entries) — the
-      // differing parts stay at the call sites as the `pick` parameter. Only
-      // the newest request owns the dropdown: a slow older /ls must never
-      // overwrite the suggestions for the text now in the input. The catch
-      // keeps the seq-guarded empty fallback (a failed machine switch rejects
-      // too, and must leave the dropdown closed and empty).
-      const suggestFrom = (id, dirParam, pick, fresh) => {
-        const seq = ++suggestSeqRef.current
-        return fetchDirList(id, dirParam, fresh).then((node) => {
-          if (seq !== suggestSeqRef.current) return
-          const matches = pick(node).slice(0, 40)
-          setSuggest(matches)
-          setSuggestOpen(!!matches.length)
-        }).catch(() => {
-          if (seq !== suggestSeqRef.current) return
-          setSuggest([]); setSuggestOpen(false)
-        })
-      }
-
-      const loadSuggestions = (raw, mid) => {
-        const id = mid || machineId
-        const t = String(raw || '').trim()
-        if (!id || !t) { killSuggestions(); return }
-        // Separator-aware split: `\` when the input looks like a Windows path.
-        const backslash = t.includes('\\') || /^[a-zA-Z]:/.test(t)
-        const sep = backslash ? '\\' : '/'
-        const idx = t.lastIndexOf(sep)
-        let parent, lastSeg
-        if (idx < 0) { parent = backslash ? t + '\\' : '/'; lastSeg = backslash ? '' : t }
-        else if (idx === t.length - 1) { parent = t.slice(0, idx) || '/'; lastSeg = '' }
-        else { parent = t.slice(0, idx) || '/'; lastSeg = t.slice(idx + 1) }
-        suggestFrom(id, parent || '/', (node) => node.dirs
-          .filter((it) => !lastSeg || it.name.toLowerCase().startsWith(String(lastSeg).toLowerCase()))
-          .map((it) => it.path))
-      }
-
-      const onPathChange = (raw) => {
-        closeBrowser()
-        killSuggestions()
-        setPath(raw); setErr('')
-        suggestTimer.current = setTimeout(() => loadSuggestions(raw), 220)
-      }
-
-      const continueSuggest = (dir) => {
-        closeBrowser()
-        killSuggestions()
-        if (!machineId || !dir) return
-        const target = String(dir).replace(/[\\/]+$/, '') || '/'
-        // Expanding a just-selected directory is a NAVIGATION step: the caching
-        // spec only sanctions "typing inside one parent directory, local
-        // filtering", so fetch fresh instead of serving up to 30s-stale entries.
-        suggestFrom(machineId, target, (node) => node.all.map((it) => it.path), true)
-      }
-
-      const selectSuggestion = (s) => {
-        if (!s) { setSuggestOpen(false); return }
-        // Auto-append the trailing separator so the path reads as a directory
-        // and the user can keep typing the next segment right away.
-        const sep = String(s).includes('\\') ? '\\' : '/'
-        const withSep = String(s).replace(/[\\/]+$/, '') + sep
-        setPath(withSep); setErr(''); setSuggestOpen(false)
-        continueSuggest(withSep)
-      }
-
       const commitPath = (p) => {
         const target = String(p || '').trim()
         if (!target || !machineId || busy || mappingBusy || (mapLocal && !mappedPath.trim())) return
@@ -1986,7 +1796,6 @@ window.__ModuleLoader__.load({
         }
         setMappingBusy(true); setErr('')
         closeBrowser()
-        killSuggestions()
         if (mapLocal) {
           saveDirectoryMapping({ machineId, remotePath: target, localPath: mappedPath }, mappingConfirm.ask, machines)
             .then(mapping => { if (mapping) return openWorkspace(mapping) })
@@ -2001,23 +1810,7 @@ window.__ModuleLoader__.load({
 
       const acceptBrowserPick = (p) => {
         setPath(String(p || ''))
-        killSuggestions()
         closeBrowser()
-      }
-
-      const pickHome = () => {
-        // Same identity contract as commitPath: /home is answered by the active
-        // pool, so name the machine this picker is showing.
-        closeBrowser()
-        killSuggestions()
-        const seq = suggestSeqRef.current
-        ensureCurrent(machineId)
-          .then(() => api('POST', '/dsh-remote/home', { machineId }))
-          .then((r) => {
-            if (seq !== suggestSeqRef.current) return
-            if (r && r.home) { setPath(r.home); setErr(''); loadSuggestions(r.home) }
-            else setErr((r && (r.hint || r.error)) || tr('picker.noHome'))
-          }).catch((e) => { if (seq === suggestSeqRef.current) setErr(String((e && e.message) || e)) })
       }
 
       const mkdirHere = () => {
@@ -2162,7 +1955,6 @@ window.__ModuleLoader__.load({
             if (mkdirPrompt || mappingConfirm.node) return
             if (e.key === 'Escape') {
               if (popOpen) { e.preventDefault(); closeBrowser(); return }
-              if (suggestOpen) { e.preventDefault(); killSuggestions(); return }
               if (!busy && !mappingBusy) { e.preventDefault(); onCancel() }
               return
             }
@@ -2175,7 +1967,7 @@ window.__ModuleLoader__.load({
           document.addEventListener('keydown', onKey)
           return () => document.removeEventListener('keydown', onKey)
         } catch { return undefined }
-      }, [open, busy, tab, path, machineId, popOpen, suggestOpen, mkdirPrompt, mapLocal, mappedPath, mappingBusy, mappingConfirm.node])
+      }, [open, busy, tab, path, machineId, popOpen, mkdirPrompt, mapLocal, mappedPath, mappingBusy, mappingConfirm.node])
 
       if (!open) return null
       const configHosts = unsavedSshHosts(machines, sshHosts)
@@ -2190,10 +1982,6 @@ window.__ModuleLoader__.load({
       return portalize(React.createElement('div', {
         style: { position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 },
         onMouseDown: backdrop.onMouseDown,
-        // Issue #52 defect 1: this was a bare onClick, so picking an autocomplete
-        // suggestion (mousedown inside the panel, panel re-laid-out, mouseup on
-        // the backdrop) closed the whole dialog. Only a press that began on the
-        // backdrop dismisses now.
         onClick: (e) => { if (backdrop.onClick(e) && !busy && !mappingBusy && !mkdirPrompt) onCancel() },
       },
         React.createElement('div', { className: 'dsh-rw-modal-panel', style: { background: v('--dsw-alias-bg-layer-1', '#18181b'), color: T.label, border: '1px solid ' + T.borderStrong, borderRadius: 12, boxShadow: '0 12px 48px rgba(0,0,0,0.5)', width: 'min(600px, 94vw)', maxHeight: 'min(680px, 92vh)', display: 'flex', flexDirection: 'column', padding: 16, boxSizing: 'border-box' }, onClick: (e) => e.stopPropagation() },
@@ -2230,7 +2018,7 @@ window.__ModuleLoader__.load({
               err ? React.createElement('div', { style: { color: T.danger, fontSize: 12 } }, err) : null,
               localPop ? renderLocalPopup() : null,
             )
-          : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, overflowY: suggestOpen ? 'visible' : 'auto' } },
+          : React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0, overflowY: 'auto' } },
               h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                 h('span', { style: { fontSize: 12, opacity: 0.8, whiteSpace: 'nowrap' } }, tr('picker.remoteMachine')),
                 h('select', { className: 'dsh-rw-input', 'aria-label': tr('picker.remoteMachine'),
@@ -2245,47 +2033,21 @@ window.__ModuleLoader__.load({
                     `${host.alias} (${machineAddress({ username: host.user, host: host.hostName || host.alias, port: host.port })})`))) : null),
               ),
               machinesError ? h('div', { role: 'alert', style: { color: T.danger, fontSize: 12 } }, tr('picker.machineListFailed', { msg: machinesError })) : null,
-              recent.length ? React.createElement('div', { style: { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' } },
-                React.createElement('span', { style: { fontSize: 11, opacity: 0.6, whiteSpace: 'nowrap' } }, tr('picker.recent')),
-                recent.map((w, i) => React.createElement('button', { type: 'button', className: 'dsh-rw-btn', key: w + i, onClick: () => { setPath(w); setErr(''); continueSuggest(w) }, style: { ...buttonS, padding: '2px 8px', fontSize: 11, fontFamily: 'monospace' } }, w))) : null,
-              React.createElement('div', { ref: suggestRef, style: { position: 'relative' } },
-                React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-                  React.createElement('input', {
-                    className: 'dsh-rw-input',
-                    value: path,
-                    onChange: (e) => onPathChange(e.target.value),
-                    onFocus: () => { if (!popOpen) loadSuggestions(path) },
-                    onKeyDown: (e) => {
-                      if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey) {
-                        e.preventDefault()
-                        if (popOpen) return
-                        if (suggestOpen && suggest.length) selectSuggestion(suggest[0])
-                        else if (path.trim()) commitPath(path)
-                      }
-                    },
-                    placeholder: (machineId ? (win ? tr('picker.pathPlaceholderWin') : tr('picker.pathPlaceholder')) : tr('picker.chooseMachineFirst')),
-                    disabled: !machineId, style: { ...inputS, flex: 1, minWidth: 120 },
-                  }),
-                  React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: openBrowser, disabled: !machineId }, tr('picker.browse')),
-                  React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: pickHome, disabled: !machineId }, tr('picker.home')),
-                ),
-                (!popOpen && suggestOpen && suggest.length)
-                  // Issue #52 defect 2: this used to be an in-flow block, so
-                  // expanding it pushed the 「设为远程工作区」 button down and the
-                  // user could never hit a button that was moving. It is now an
-                  // absolutely-positioned overlay hanging off `suggestRef`
-                  // (position: relative), which also keeps the modal's height —
-                  // and therefore its centred edges — stable while open (that
-                  // stability is what makes the press-origin guard above exact).
-                  // `paddingBottom` lets the last entries scroll clear of the
-                  // button row, which is lifted over the dropdown by zIndex.
-                  ? React.createElement('div', { style: { position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 60, marginTop: 6, paddingBottom: 36, background: v('--dsw-alias-bg-overlay', '#1e1e1e'), color: T.label, border: '1px solid ' + T.borderStrong, borderRadius: 8, maxHeight: 200, overflowY: 'auto', boxShadow: '0 6px 24px rgba(0,0,0,0.25)' } },
-                      // Issue #52 defect 1, local belt-and-braces: swallow the
-                      // gesture so no ancestor (least of all the backdrop) can
-                      // observe a click that began on a suggestion.
-                      suggest.map((s, i) => React.createElement('div', { key: s + i, className: 'dsh-rw-list-item', onMouseDown: (e) => { e.preventDefault(); e.stopPropagation(); selectSuggestion(s) }, style: { padding: '6px 10px', cursor: 'pointer', fontSize: 12, fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, s)),
-                    )
-                  : null,
+              React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                React.createElement('input', {
+                  className: 'dsh-rw-input',
+                  value: path,
+                  autoComplete: 'off', autoCapitalize: 'none', spellCheck: false,
+                  onChange: (e) => { closeBrowser(); setPath(e.target.value); setErr('') },
+                  onKeyDown: (e) => {
+                    if (e.key !== 'Enter' || e.ctrlKey || e.metaKey || e.nativeEvent?.isComposing) return
+                    e.preventDefault()
+                    if (!popOpen) commitPath(path)
+                  },
+                  placeholder: machineId ? tr(win ? 'picker.pathPlaceholderWin' : 'picker.pathPlaceholder') : tr('picker.chooseMachineFirst'),
+                  disabled: !machineId, style: { ...inputS, flex: 1, minWidth: 120 },
+                }),
+                React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: openBrowser, disabled: !machineId }, tr('picker.browse')),
               ),
               popOpen ? renderDirPopup() : null,
               err ? React.createElement('div', { style: { color: T.danger, fontSize: 12 } }, err) : null,
@@ -2295,10 +2057,7 @@ window.__ModuleLoader__.load({
               mapLocal && registerWorkspace !== false ? h(LocalMappingDirectory, {
                 value: mappedPath, onChange: setMappedPath, onError: setErr,
               }) : null,
-              // The action row rides ABOVE the dropdown (zIndex 70) on its own
-              // opaque layer, so the list slides out from behind it instead of
-              // covering 「设为远程工作区」.
-              React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center', position: 'relative', zIndex: 70, background: v('--dsw-alias-bg-layer-1', '#18181b') } },
+              React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center' } },
                 React.createElement('span', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, path ? tr('picker.selected', { path }) : ''),
                 React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => commitPath(path), disabled: busy || mappingBusy || !machineId || !path.trim() || (mapLocal && !mappedPath.trim()) }, busy || mappingBusy ? tr('picker.mirroring') : tr('picker.setRemoteWs')),
               ),

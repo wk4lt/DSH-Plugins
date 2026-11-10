@@ -107,6 +107,7 @@ test('the workspace picker lists SSH config aliases and saves only the selected 
   assert.equal(select(tree).props.value, 'machine:' + saved.id)
   assert.deepEqual(options(tree), ['', 'machine:' + saved.id, 'ssh:vscode-other'])
   assert.equal(readFileSync(sshConfig, 'utf8'), contents)
+  ui.button(tree, /^浏览…$/).el.props.onClick()
   const listed = await listing
   assert.equal(listed.status, 200, listed.raw)
   assert(listed.json.items.some(entry => entry.name === 'projects'))

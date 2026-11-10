@@ -192,68 +192,57 @@ test('remote picker opens a remote workspace anchor for the chosen checkout', as
   }
 })
 
-test('opening the remote directory browser dismisses autocomplete and drops late results', async () => {
+test('remote paths are typed or selected through Browse', async () => {
   const listings = []
-  const directory = (base, name) => response({
-    path: base, items: [{ type: 'dir', name, path: base + '/' + name }], platform: 'posix',
-  })
-  let finishSlowListing
-  const slowListing = new Promise(resolve => { finishSlowListing = resolve })
-  const ui = mountClient({ fetch: async url => {
+  const submitted = []
+  const picked = []
+  const ui = mountClient({ fetch: async (url, opts) => {
     const request = new URL(url, 'http://localhost')
-    if (request.pathname.endsWith('/machines')) return response({ machines: [machine], currentId: 'dev' })
+    if (request.pathname.endsWith('/machines')) {
+      return response({ machines: [{ ...machine, recentWorkspaces: ['/recent-project'] }], currentId: 'dev' })
+    }
     if (request.pathname.endsWith('/ssh-config')) return response({ entries: [] })
     if (request.pathname.endsWith('/current')) return response({ ok: true })
+    if (request.pathname.endsWith('/bindings')) return response({ mirrors: [] })
     if (request.pathname.endsWith('/ls')) {
       const path = request.searchParams.get('path')
       listings.push(path)
-      if (path === '/slow') return slowListing
-      if (path.startsWith('/slow')) return directory('/slow', 'late')
-      if (path.startsWith('/projects')) return directory('/projects', 'alpha')
-      return response({ path: '/', items: [], platform: 'posix' })
+      return response({ path: path || '/', items: [], platform: 'posix' })
+    }
+    if (request.pathname.endsWith('/mirror')) {
+      const { path } = JSON.parse(opts.body)
+      submitted.push(path)
+      return response({ path, localMirror: '/workspace' })
     }
     throw new Error('unexpected request: ' + url)
   } })
   try {
     const picker = ui.component('sidebar.workspaces.directoryFlow')
-    const props = { open: true, onPicked() {}, onCancel() {} }
+    const props = { open: true, onPicked: (...args) => picked.push(args), onCancel() {} }
     const render = () => ui.settleComponent(picker, props)
-    const input = tree => ui.inputs(tree).find(field => field.placeholder?.includes('远程路径'))
-    const browse = tree => ui.button(tree, /^浏览…$/).el.props.onClick()
-    const type = (tree, value) => input(tree).onChange({ target: { value } })
+    const input = tree => ui.inputs(tree).find(field => field.placeholder === '输入远程路径')
     let tree = await render()
     ui.button(tree, /^远程$/).el.props.onClick()
     tree = await render()
+    assert.doesNotMatch(ui.text(tree), /最近:|主目录|recent-project/)
+    assert.equal(input(tree).autoComplete, 'off')
 
-    type(tree, '/projects/')
-    ui.timers.flush(220)
+    input(tree).onChange({ target: { value: '/projects/alpha' } })
+    ui.timers.flush(1000)
     await ui.tick()
     tree = await render()
-    assert.match(ui.text(tree), /\/projects\/alpha/)
-    browse(tree)
+    assert.deepEqual(listings, [])
+    input(tree).onKeyDown({ key: 'Enter', preventDefault() {} })
+    await ui.tick()
+    assert.deepEqual(submitted, ['/projects/alpha'])
+    assert.deepEqual(picked, [['/workspace', '/projects/alpha']])
+
+    ui.button(await render(), /^浏览…$/).el.props.onClick()
     await ui.tick()
     tree = await render()
-    assert.doesNotMatch(ui.text(tree), /\/projects\/alpha/)
-    assert.equal(ui.button(tree, /^选用此路径$/).disabled, false)
-
-    type(tree, '/queued/')
-    browse(await render())
-    ui.timers.flush(220)
-    await ui.tick()
-    assert(!listings.includes('/queued'))
-
-    type(await render(), '/slow/')
-    ui.timers.flush(220)
-    await ui.tick()
-    assert(listings.includes('/slow'))
-    browse(await render())
-    await ui.tick()
-    finishSlowListing(directory('/slow', 'late'))
-    await ui.tick()
-    tree = await render()
-    assert.doesNotMatch(ui.text(tree), /\/slow\/late/)
+    assert.deepEqual(listings, ['/projects/alpha'])
     ui.button(tree, /^选用此路径$/).el.props.onClick()
-    assert.equal(input(await render()).value, '/slow')
+    assert.equal(input(await render()).value, '/projects/alpha')
   } finally {
     ui.dispose()
   }
