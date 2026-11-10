@@ -431,9 +431,9 @@ export async function apply(ctx, config) {
   // so one request that resolves several machines reads the file once, while an
   // edit to ~/.ssh/config still lands almost immediately.
   let sshConfigCache = { text: '', at: 0 }
-  const sshConfigText = () => {
+  const sshConfigText = (fresh = false) => {
     const now = Date.now()
-    if (now - sshConfigCache.at > 2000) sshConfigCache = { text: readSshConfigText(), at: now }
+    if (fresh || now - sshConfigCache.at > 2000) sshConfigCache = { text: readSshConfigText(), at: now }
     return sshConfigCache.text
   }
 
@@ -4246,16 +4246,12 @@ export async function apply(ctx, config) {
                 return sendJson(res, (err && err.httpStatus) || 500, { ok: false, error: String((err && err.message) || err) })
               }
             }
-            // Issue #73: one click on a host listed from ~/.ssh/config. The settings
-            // page no longer asks the user to understand "alias" vs "copy": it lists
-            // the file's hosts and this action adopts one — upsert an alias machine
-            // (never a duplicate), make it the current machine, and let the caller
-            // connect/probe next. Nothing about the user's file is rewritten here:
-            // the alias IS the source of truth (issue #50).
+            // Adopt a host selected from ~/.ssh/config and make it current.
+            // Re-read the config to pick up changes since the picker listed it.
             if (action === 'from-ssh-config') {
               const alias = String(body.alias || body.host || '').trim()
               if (!alias) return sendJson(res, 400, { ok: false, error: 'alias required' })
-              const known = listAliases(sshConfigText()).find((a) => a.alias === alias)
+              const known = listAliases(sshConfigText(true)).find((a) => a.alias === alias)
               if (!known) {
                 return sendJson(res, 404, {
                   ok: false,
