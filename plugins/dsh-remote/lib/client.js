@@ -144,6 +144,7 @@ window.__ModuleLoader__.load({
         'settings.current': '当前',
         'settings.edit': '编辑',
         'settings.delete': '删除',
+        'settings.sshConfigSource': '来自 SSH 配置',
         'settings.currentMachine': '当前远程机：{name}',
         'settings.clearCurrent': '取消设为当前（active remote = none）',
         'settings.noActive': '当前没有活动远程机：保存的机器只是备用连接，不会自动进入会话上下文（本地会话不受影响）。',
@@ -244,7 +245,7 @@ window.__ModuleLoader__.load({
         'settings.sectionShow': '展开此栏',
         'settings.checking': '检查中…',
         'settings.checkUpdate': '检查更新',
-        'settings.deleted': '已删除',
+        'settings.deleted': '已移除「{name}」的保存连接',
         'settings.saved': '已保存更新',
         'settings.rebound': '已将 {n} 个本地工作区镜像重新绑定到新地址（内容保留，无需重新同步）',
         'settings.added': '已添加 — 可设为当前',
@@ -257,7 +258,8 @@ window.__ModuleLoader__.load({
         'settings.shellWin': '（Windows · Git Bash）',
         'settings.shellWinNoGit': '（Windows · 未找到 Git Bash）',
         'settings.shellPosix': '（POSIX）',
-        'settings.deleteConfirm': '确定删除这台机器？',
+        'settings.deleteConfirm': '删除 DSH 中保存的连接「{name}」（{address}）？绑定此连接的远程会话将无法连接。',
+        'settings.deleteMappingNote': '{count} 条关联目录映射会显示为「服务器已移除」，可以编辑后重新绑定。',
         'settings.delFail': '删除失败: {msg}',
         'settings.addFail': '保存失败: {msg}',
         'picker.title': '选择工作目录',
@@ -433,6 +435,7 @@ window.__ModuleLoader__.load({
         'settings.current': 'current',
         'settings.edit': 'Edit',
         'settings.delete': 'Delete',
+        'settings.sshConfigSource': 'From SSH config',
         'settings.currentMachine': 'Current remote: {name}',
         'settings.clearCurrent': 'Clear current (active remote = none)',
         'settings.noActive': 'No active remote machine: saved machines are standby connections and never enter a session context automatically (local sessions are unaffected).',
@@ -527,7 +530,7 @@ window.__ModuleLoader__.load({
         'settings.sectionShow': 'Expand section',
         'settings.checking': 'Checking…',
         'settings.checkUpdate': 'Check for updates',
-        'settings.deleted': 'Deleted',
+        'settings.deleted': 'Removed the saved connection for {name}',
         'settings.saved': 'Saved',
         'settings.rebound': 'Rebound {n} local workspace mirror(s) to the new address (content kept — no re-sync needed)',
         'settings.added': 'Added — you can set it as current',
@@ -540,7 +543,8 @@ window.__ModuleLoader__.load({
         'settings.shellWin': ' (Windows · Git Bash)',
         'settings.shellWinNoGit': ' (Windows · no Git Bash found)',
         'settings.shellPosix': ' (POSIX)',
-        'settings.deleteConfirm': 'Delete this machine?',
+        'settings.deleteConfirm': 'Delete the saved DSH connection for {name} ({address})? Remote sessions bound to this connection will lose access.',
+        'settings.deleteMappingNote': 'Linked directory mappings ({count}) will show “Server removed”. You can edit them to choose another server.',
         'settings.delFail': 'Delete failed: {msg}',
         'settings.addFail': 'Save failed: {msg}',
         'picker.title': 'Select working directory',
@@ -1133,20 +1137,23 @@ window.__ModuleLoader__.load({
       const [msg, setMsg] = React.useState('')
       const [err, setErr] = React.useState('')
       const confirmUi = useConfirm()
+      const refreshSeq = React.useRef(0)
 
       const refresh = async () => {
+        const seq = ++refreshSeq.current
         const result = await Promise.all([
           api('GET', '/dsh-remote/machines'),
           api('GET', '/dsh-remote/mappings'),
           api('GET', '/dsh-remote/ssh-config'),
         ])
+        if (seq !== refreshSeq.current) return
         setMachines(result[0].machines || [])
         setMappings(result[1].mappings || [])
         setSshHosts(result[2].entries || [])
       }
       const reload = () => refresh().catch(error => setErr(error.message))
       const refreshSettings = async () => {
-        if (refreshing) return
+        if (refreshing || busy) return
         setRefreshing(true); setRefreshStatus(''); setErr('')
         try {
           await refresh()
@@ -1231,6 +1238,27 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const removeServer = async machine => {
+        if (!machine.id || busy || refreshing) return
+        const name = machine.name || machine.host
+        const count = mappings.filter(mapping => mapping.machineId === machine.id).length
+        const question = tr('settings.deleteConfirm', { name, address: machineAddress(machine) })
+        const note = count ? '\n\n' + tr('settings.deleteMappingNote', { count }) : ''
+        setBusy(true)
+        try {
+          if (!(await confirmUi.ask(question + note))) return
+          setErr(''); setRefreshStatus('')
+          const result = await api('POST', '/dsh-remote/machines', { action: 'delete', id: machine.id })
+          refreshSeq.current++
+          setMachines(result.machines)
+          setRefreshStatus(tr('settings.deleted', { name }))
+        } catch (error) {
+          setErr(error.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const showMapping = mapping => { setErr(''); setEditMapping(mapping) }
       const changeMapping = (key, value) => setEditMapping(previous => ({ ...previous, [key]: value }))
       const saveMapping = async () => {
@@ -1283,8 +1311,8 @@ window.__ModuleLoader__.load({
             settingsButton(tr('settings.openSshConfig'), async () => {
               try { await api('POST', '/dsh-remote/ssh-config', { action: 'open' }) } catch (error) { setErr(error.message) }
             }),
-            settingsButton(tr(refreshing ? 'settings.refreshing' : 'settings.hostListRefresh'), refreshSettings, refreshing)),
-          refreshStatus ? h('p', { role: 'status', style: { color: T.ok, margin: '6px 0', fontSize: 12 } }, refreshStatus) : null,
+            settingsButton(tr(refreshing ? 'settings.refreshing' : 'settings.hostListRefresh'), refreshSettings, refreshing || busy)),
+          refreshStatus ? h('p', { role: 'status', style: { color: T.ok, margin: '6px 0', fontSize: 12, overflowWrap: 'anywhere' } }, refreshStatus) : null,
           listed.length ? listed.map(machine => {
             const key = machine.id || machine.host
             const result = rowState[key]
@@ -1293,10 +1321,12 @@ window.__ModuleLoader__.load({
             return h('div', { key, style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 8, alignItems: 'center', padding: '6px 0', borderTop: '1px solid ' + T.border } },
               h('div', { style: { display: 'grid', minWidth: 0, gap: 2 } },
                 h('strong', { title: name, style: ellipsisStyle }, name),
-                h('span', { title: address, style: { ...ellipsisStyle, fontFamily: 'monospace' } }, address)),
+                h('span', { title: address, style: { ...ellipsisStyle, fontFamily: 'monospace' } }, address),
+                machine.id ? null : h('span', { style: { ...ellipsisStyle, fontSize: 11, color: T.muted } }, tr('settings.sshConfigSource'))),
               h('div', { style: { display: 'flex', gap: 8, whiteSpace: 'nowrap' } },
-                settingsButton(tr('settings.edit'), () => showServer(machine)),
-                settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), result?.busy)),
+                settingsButton(tr('settings.edit'), () => showServer(machine), busy),
+                settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), busy || result?.busy),
+                machine.id ? settingsButton(tr('settings.delete'), () => removeServer(machine), busy || refreshing || result?.busy) : null),
               result?.text ? h('span', { role: 'status', style: { gridColumn: '1 / -1', overflowWrap: 'anywhere', color: result.failed ? T.danger : T.ok } }, result.text) : null)
           }) : h('p', null, tr('mapping.noServers'))),
         h('section', { style: boxS, 'aria-label': tr('mapping.title') },

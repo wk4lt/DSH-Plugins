@@ -144,6 +144,55 @@ test('an empty server list can add its first machine, edit it, and open mapping 
   }
 })
 
+test('settings delete saved connections after confirmation and identify SSH config entries', async () => {
+  const deleted = []
+  let machines = [{ ...machine, useSshConfig: true }]
+  let fail = true
+  const ui = mountClient({ fetch: async (url, opts) => {
+    if (url.endsWith('/machines') && opts.method === 'POST') {
+      deleted.push(JSON.parse(opts.body))
+      if (fail) return { ok: false, status: 500, json: async () => ({ error: 'fixture delete failed' }) }
+      machines = []
+      return response({ machines, currentId: null })
+    }
+    if (url.endsWith('/machines')) return response({ machines })
+    if (url.endsWith('/mappings')) return response({ mappings })
+    if (url.endsWith('/ssh-config')) return response({ entries: [
+      { alias: machine.host, user: 'me', port: 22 }, { alias: 'ssh-only', user: 'me', port: 22 },
+    ] })
+    throw new Error('unexpected request: ' + url)
+  } })
+  try {
+    const remove = async (tree, answer) => {
+      const pending = ui.button(tree, /^删除$/).el.props.onClick()
+      const confirming = await ui.settle()
+      const dialog = ui.components(confirming).find(node => node.type.name === 'ConfirmDialog')
+      assert.match(dialog.props.message, /开发机.*me@dev:22/)
+      assert.match(dialog.props.message, /2 条关联目录映射/)
+      assert.equal(ui.button(confirming, /^删除$/).disabled, true)
+      dialog.props.onAnswer(answer)
+      await pending
+      return ui.settle()
+    }
+    let tree = await ui.settle()
+    assert.match(ui.text(tree), /ssh-only.*来自 SSH 配置/)
+    tree = await remove(tree, false)
+    assert.deepEqual(deleted, [])
+    tree = await remove(tree, true)
+    assert.match(ui.text(tree), /fixture delete failed/)
+    assert.equal(ui.button(tree, /^删除$/).disabled, false)
+    fail = false
+    tree = await remove(tree, true)
+    assert.deepEqual(deleted, [{ action: 'delete', id: 'dev' }, { action: 'delete', id: 'dev' }])
+    assert.match(ui.text(tree), /已移除「开发机」的保存连接/)
+    assert.match(ui.text(tree), /devme@dev:22来自 SSH 配置/)
+    assert.match(ui.text(tree), /服务器已移除 · 2/)
+    assert(!ui.buttons(tree).some(button => button.label === '删除'))
+  } finally {
+    ui.dispose()
+  }
+})
+
 test('remote picker opens a remote workspace anchor for the chosen checkout', async () => {
   const requests = []
   const picked = []

@@ -258,6 +258,19 @@ test('explicit mappings route existing checkouts and preserve the mirror workflo
     await assert.rejects(run('rw_list_dir', {}), { code: 'REMOTE_BINDING_MISSING' })
     assert.equal((await resolve(anchor)).status, 409)
     assert.match(shell.resolveTarget({ cwd: anchor, machines: host.registryFile }).error, /binding is missing/)
+
+    const deleteServer = () => host.call('/dsh-remote/machines', { body: { action: 'delete', id: server.id } })
+    const deletion = await deleteServer()
+    assert.equal(deletion.status, 200, deletion.raw)
+    assert.equal(deletion.json.currentId, null)
+    assert.deepEqual(deletion.json.machines.map(machine => machine.id), [otherServer.id])
+    assert.equal((await deleteServer()).status, 404)
+    assert.deepEqual((await host.call('/dsh-remote/mappings', { method: 'GET' })).json.mappings, [beta])
+    assert(existsSync(path.join(mirror.json.localMirror, '.dsh-remote-meta.json')))
+    assert.equal(readFileSync(path.join(local, 'changed.txt'), 'utf8'), 'windows version')
+    await assert.rejects(host.tool('rw_list_dir').execute({}, {
+      agent: { session: { header: { cwd: mirror.json.localMirror } } },
+    }), /saved SSH server for this workspace is unavailable/)
   } finally {
     await host?.dispose()
     await promptFiber?.dispose()
