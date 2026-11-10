@@ -763,9 +763,14 @@ export async function apply(ctx, config) {
       ? 'workspace:' + (target.machineId || '') + ':' + poolKey(target)
       : target.machineId ? 'mapping:' + target.machineId : poolKey(target)
     // Credentials can be refreshed, but a session cannot change SSH identity.
-    const rec = machineRecordFor(target)
-    if (target.pinned && ((target.machineId && rec?.id !== target.machineId) || (rec && !identityMatches(rec, target)))) {
-      throw codedError('REMOTE_BINDING_CHANGED', 'The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.', { httpStatus: 409 })
+    const rec = target.pinned && target.machineId
+      ? machines[machineIndex(target.machineId)]
+      : machineRecordFor(target)
+    if (target.pinned && ((target.machineId && !rec) || (rec && !identityMatches(rec, target)))) {
+      const message = rec
+        ? 'The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.'
+        : 'The saved SSH server for this workspace is unavailable. Open a new remote workspace to connect again.'
+      throw codedError('REMOTE_BINDING_CHANGED', message, { httpStatus: 409 })
     }
     const eff = rec ? withSshConfig(rec) : null
     // Issue #51: on the system-OpenSSH backend an alias machine connects AS its
@@ -3353,20 +3358,15 @@ export async function apply(ctx, config) {
     const i = machineIndex(String(id || ''))
     if (i < 0) throw codedError('MACHINE_NOT_FOUND', 'machine not found', { httpStatus: 404 })
     const m = machines[i]
+    const wasCurrent = store.currentId === m.id
+    const currentId = wasCurrent ? null : store.currentId
+    // Persist the removal before changing the list or awaiting credential cleanup.
+    saveMachines(machines.filter((_, index) => index !== i), currentId)
+    machines.splice(i, 1)
+    store.currentId = currentId
+    if (wasCurrent || ephemeral?.id === m.id) await clearActiveMachine()
     if (m.credentialBackend && m.credentialBackend !== 'plain') {
       await deleteSecret(m.id, secretsDir()).catch(() => {})
-    }
-    machines.splice(i, 1)
-    const wasCurrent = store.currentId === m.id
-    if (wasCurrent) {
-      // Issue #13: deleting the current machine leaves NO active
-      // remote context (never auto-promote a sibling — that would
-      // make an unrelated machine leak into the session again).
-      store.currentId = null
-      saveMachines(machines, null)
-      await clearActiveMachine()
-    } else {
-      saveMachines(machines, store.currentId)
     }
     return { machines: machinesForClient(), currentId: store.currentId }
   }

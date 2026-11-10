@@ -1,6 +1,6 @@
 {
   "name": "@wk4lt/dsh-remote",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Map local DSH workspaces to SSH directories and run remote development tasks.",
   "license": "MIT",
   "author": "flymysql <flyphp@outlook.com>",
