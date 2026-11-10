@@ -2,7 +2,7 @@
 
 在 DSH Web / Desktop 中，用一个 Markdown 文件声明一个 Agent。插件将 frontmatter 编译为 DSH 原生 Agent preset，正文原样用作 `persona.prefix`。不使用 `complete: true`，不修改 DSH 核心，也不向用户的 `cordis.patch.yml` 写入预设行。
 
-开发验证版本：DSH `0.2.2-rc.1`。插件版本：`0.2.0`。
+开发验证版本：DSH `0.2.2-rc.1`。插件版本：`0.2.1`。
 
 ## 安装与使用
 
@@ -12,7 +12,7 @@
 dsh plugin --profile desktop add file:./plugins/software-workflow
 ```
 
-Web profile 将 `desktop` 换成 `web`。安装不需要 `--ignore-scripts`，插件没有安装构建脚本。
+Web profile 将 `desktop` 换成 `web`。源码 ZIP 已包含插件所需的 Zod 和 YAML 运行时代码，导入时无需另行安装这两个依赖。安装不需要 `--ignore-scripts`，插件没有安装构建脚本。
 
 重启 DSH，在空白新会话右侧的 **Workflow** 下拉框选择 **None / Design / Develop / Test / Debug**。发送第一条消息后，预设固定。工作流会整套替换普通 Agent 的提示词和工具；**None** 恢复进入工作流前的普通预设。从左侧普通 Agent 菜单选择预设，也会退出工作流。
 

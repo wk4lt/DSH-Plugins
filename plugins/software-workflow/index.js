@@ -1,6 +1,6 @@
 import { symbols } from '@deepseek-ai/cordis';
 import AgentPreset from '@deepseek-ai/dsh-agent-preset';
-import { z } from 'zod';
+import { z } from './vendor/agent-dependencies.js';
 import { loadAgents } from './agent-files.js';
 import { compileAgent } from './agent-presets.js';
 

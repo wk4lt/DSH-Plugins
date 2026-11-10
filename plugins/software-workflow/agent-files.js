@@ -2,8 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LineCounter, parseDocument, visit } from 'yaml';
-import { z } from 'zod';
+import { LineCounter, parseDocument, visit, z } from './vendor/agent-dependencies.js';
 
 export const builtInDirectory = fileURLToPath(new URL('./agents/', import.meta.url));
 export const reservedIds = new Set(['standard', 'ptc', 'minimal', 'cordis', 'none']);

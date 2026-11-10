@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { loadAgents, parseAgentFile } from '../agent-files.js';
 
 const md = (fields = '', body = 'Instructions with literal ${NOT_EXPANDED}.\n') => `---\nname: Review\ndescription: Review project changes.\n${fields}\n---\n${body}`;
@@ -15,6 +16,18 @@ async function fixture(t) {
   });
   return root;
 }
+
+test('built-in agents load from an extracted source package without node_modules', async t => {
+  const root = await fixture(t);
+  for (const entry of ['package.json', 'agent-files.js', 'agents', 'vendor']) {
+    await cp(new URL(`../${entry}`, import.meta.url), join(root, entry), { recursive: true });
+  }
+  const { loadAgents: loadPackagedAgents } = await import(pathToFileURL(join(root, 'agent-files.js')).href);
+  const agents = await loadPackagedAgents({ home: root });
+  assert.deepEqual(agents.map(agent => agent.id), [
+    'wk4lt-workflow-design', 'wk4lt-workflow-develop', 'wk4lt-workflow-test', 'wk4lt-workflow-debug',
+  ]);
+});
 
 test('Markdown keeps the body literal, uses filename identity, and applies documented defaults', () => {
   const agent = parseAgentFile(md(), '/agents/my-review.md', { env: {} });
