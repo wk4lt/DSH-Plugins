@@ -93,7 +93,7 @@ export function buildSftpSurface(sftp, { commandTimeoutMs, onTimeout }) {
         })
       })
     })(P(p), P(d)),
-    realpath: (p) => withTimeout((d, cb) => sftp.realpath(d, cb))(P(p)),
+    realpath: (p) => withTimeout((d, cb) => sftp.realpath(d, cb))(p === '.' ? p : P(p)),
     // Attribute write (chmod semantics live in setstat at the protocol level,
     // so BOTH backends — ssh2's SFTPWrapper and its raw protocol SFTP — answer
     // this one shape). Used by rw_edit to restore the original mode after an

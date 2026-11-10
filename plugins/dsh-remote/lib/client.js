@@ -282,7 +282,11 @@ window.__ModuleLoader__.load({
         'picker.chooseMachineFirst': '先选远程机器',
         'picker.browse': '浏览…',
         'picker.setRemoteWs': '设为远程工作区',
-        'picker.mirroring': '镜像中…',
+        'picker.browseHome': '从主目录浏览',
+        'picker.homeUnavailable': '无法获取远端 SSH 用户的主目录',
+        'picker.savingMapping': '正在保存映射…',
+        'picker.openingWorkspace': '正在打开远程工作区…',
+        'picker.setupTimeout': '打开远程工作区超时，请检查 SSH 连接后重试。',
         'picker.cancel': '取消',
         'confirm.title': '请确认',
         'picker.selectDir': '选择工作目录',
@@ -305,7 +309,6 @@ window.__ModuleLoader__.load({
         'picker.timeout': '目录选择已超时，请重试或直接在输入框填本地路径',
         'picker.pickerBinNotFound': '未找到目录选择器程序',
         'picker.noSysPickerHost': '当前系统不支持自动打开目录选择器，请在输入框直接填本地路径',
-        'picker.noHomeWin': 'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径',
         'picker.typePath': ' — 可直接在输入框填本地路径',
         'picker.newDirName': '新建目录名（在 {path} 下）',
         'picker.invalidDirName': '请输入单个目录名，不能包含路径分隔符',
@@ -567,7 +570,11 @@ window.__ModuleLoader__.load({
         'picker.chooseMachineFirst': 'Choose a remote machine first',
         'picker.browse': 'Browse…',
         'picker.setRemoteWs': 'Set as remote workspace',
-        'picker.mirroring': 'Mirroring…',
+        'picker.browseHome': 'Browse from home',
+        'picker.homeUnavailable': 'Could not find the SSH user’s home directory',
+        'picker.savingMapping': 'Saving mapping…',
+        'picker.openingWorkspace': 'Opening remote workspace…',
+        'picker.setupTimeout': 'Opening the remote workspace timed out. Check the SSH connection and try again.',
         'picker.cancel': 'Cancel',
         'confirm.title': 'Please confirm',
         'picker.selectDir': 'Select working directory',
@@ -590,7 +597,6 @@ window.__ModuleLoader__.load({
         'picker.timeout': 'Directory selection timed out — retry or type a local path directly',
         'picker.pickerBinNotFound': 'Directory picker program not found',
         'picker.noSysPickerHost': 'This system cannot auto-open a directory picker — type a local path in the input box',
-        'picker.noHomeWin': 'Windows remotes do not support ~ resolution — enter an absolute path',
         'picker.typePath': ' — type a local path in the input box instead',
         'picker.newDirName': 'New directory name (under {path})',
         'picker.invalidDirName': 'Enter a single directory name without path separators',
@@ -722,7 +728,7 @@ window.__ModuleLoader__.load({
       '请输入单个目录名，不能包含路径分隔符': 'picker.invalidDirName',
       '请先进入要创建子目录的远程目录': 'picker.mkdirParentRequired',
       '同名文件或目录已存在': 'picker.mkdirAlreadyExists',
-      'Windows 远程暂不支持 ~ 解析，请直接输入绝对路径': 'picker.noHomeWin',
+      '无法获取远端 SSH 用户的主目录': 'picker.homeUnavailable',
       '无法连接 npm registry': 'settings.registryUnreachable',
     }
     const HOST_ERROR_PREFIX = [
@@ -770,21 +776,28 @@ window.__ModuleLoader__.load({
       return Object.assign({}, body || {}, { sessionId })
     }
 
-    async function api(method, path, body) {
-      const opts = { method, headers: {} }
+    const WORKSPACE_SETUP_TIMEOUT_MS = 45_000
+    async function api(method, path, body, signal) {
+      const opts = { method, headers: {}, signal }
       if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body) }
       const res = await fetch(apiPath(path), opts)
-      const data = await res.json().catch(() => ({}))
+      const data = await res.json().catch(() => {
+        signal?.throwIfAborted()
+        return {}
+      })
       if (!res.ok) throw new Error(trHostError((data && (data.error || data.message))) || 'HTTP ' + res.status)
       return data
     }
 
     // Like api() but returns {status, data} so callers can handle 409 etc.
-    async function apiRaw(method, path, body) {
-      const opts = { method, headers: {} }
+    async function apiRaw(method, path, body, signal) {
+      const opts = { method, headers: {}, signal }
       if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body) }
       const res = await fetch(apiPath(path), opts)
-      const data = await res.json().catch(() => ({}))
+      const data = await res.json().catch(() => {
+        signal?.throwIfAborted()
+        return {}
+      })
       if (data && typeof data.error === 'string') data.error = trHostError(data.error)
       if (data && typeof data.message === 'string') data.message = trHostError(data.message)
       return { status: res.status, data }
@@ -957,19 +970,22 @@ window.__ModuleLoader__.load({
      * Themed confirm dialog. Uses the host Modal when the build ships one
      * (always portaled, focus trap, autofocus, focus restore, Escape, IME
      * guard); otherwise our own press-guarded portalized overlay. Either way it
-     * replaces `window.confirm`, which is visually alien and may be suppressed
-     * by embedders. Safe for Mask adoption here because the content never
-     * re-lays-out mid-gesture (no autocomplete list — that is why the DIRECTORY
-     * picker keeps its custom guarded overlay).
+     * replaces `window.confirm`. Confirmations opened by the directory picker
+     * use the higher overlay so its backdrop cannot intercept their controls.
      */
     function ConfirmDialog(props) {
-      const { message, onAnswer } = props
+      const { message, onAnswer, abovePicker } = props
+      const backdrop = useBackdropGuard()
+      const panelRef = React.useRef(null)
+      const close = () => onAnswer(false)
+      const useHostModal = Modal && !abovePicker
+      if (useModalLayerFn) useModalLayerFn(panelRef, !useHostModal, close)
       const cancelBtn = React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: buttonS, onClick: () => onAnswer(false) }, tr('file.cancel'))
       const okBtn = React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, 'data-modal-autofocus': true, onClick: () => onAnswer(true) }, tr('common.confirm'))
-      if (Modal) {
+      if (useHostModal) {
         return React.createElement(Modal, {
           open: true,
-          onClose: () => onAnswer(false),
+          onClose: close,
           title: tr('confirm.title'),
           closeLabel: tr('picker.close'),
         },
@@ -977,13 +993,16 @@ window.__ModuleLoader__.load({
           React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 } }, cancelBtn, okBtn),
         )
       }
-      const backdrop = useBackdropGuard()
       return portalize(React.createElement('div', {
         style: { position: 'fixed', inset: 0, zIndex: 1000001, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 },
         onMouseDown: backdrop.onMouseDown,
-        onClick: (e) => { if (backdrop.onClick(e)) onAnswer(false) },
+        onClick: (e) => { if (backdrop.onClick(e)) close() },
       },
-        React.createElement('div', { style: { background: v('--dsw-alias-bg-layer-1', '#18181b'), color: T.label, border: '1px solid ' + T.borderStrong, borderRadius: 12, boxShadow: '0 12px 48px rgba(0,0,0,0.5)', padding: 16, maxWidth: 'min(460px, 86vw)' }, onClick: (e) => e.stopPropagation() },
+        React.createElement('div', {
+          ref: panelRef, role: 'dialog', 'aria-modal': true, 'aria-label': tr('confirm.title'), tabIndex: -1,
+          onKeyDown: (e) => { if (e.key === 'Escape') { e.preventDefault(); close() } },
+          style: { background: v('--dsw-alias-bg-layer-1', '#18181b'), color: T.label, border: '1px solid ' + T.borderStrong, borderRadius: 12, boxShadow: '0 12px 48px rgba(0,0,0,0.5)', padding: 16, maxWidth: 'min(460px, 86vw)' }, onClick: (e) => e.stopPropagation(),
+        },
           React.createElement('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 10 } }, tr('confirm.title')),
           React.createElement('div', { style: { fontSize: 13, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, message),
           React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 14 } }, cancelBtn, okBtn),
@@ -993,12 +1012,13 @@ window.__ModuleLoader__.load({
 
     /** Promise-style confirm: `if (!(await confirm.ask(msg))) return`. Render
      * `confirm.node` anywhere in the component's tree. */
-    function useConfirm() {
+    function useConfirm(abovePicker = false) {
       const [req, setReq] = React.useState(null)
       const ask = React.useCallback((message) => new Promise((resolve) => setReq({ message, resolve })), [])
       const node = req
         ? React.createElement(ConfirmDialog, {
           message: req.message,
+          abovePicker,
           onAnswer: (ok) => { setReq(null); req.resolve(ok) },
         })
         : null
@@ -1081,7 +1101,7 @@ window.__ModuleLoader__.load({
       }, h('h3', null, title), contents)))
     }
 
-    function LocalMappingDirectory({ value, onChange, onError }) {
+    function LocalMappingDirectory({ value, onChange, onError, disabled }) {
       const [picking, setPicking] = React.useState(false)
       const pick = async () => {
         setPicking(true)
@@ -1098,12 +1118,12 @@ window.__ModuleLoader__.load({
       return h('div', { style: { display: 'flex', flex: 1, gap: 6, minWidth: 0 } },
         h('input', { className: 'dsh-rw-input', style: { ...inputS, minWidth: 0 },
           'aria-label': tr('mapping.local'), placeholder: tr('picker.localPlaceholder'),
-          value, onChange: e => onChange(e.target.value) }),
-        settingsButton(picking ? tr('picker.opening') : tr('picker.browse'), pick, picking))
+          value, disabled, onChange: e => onChange(e.target.value) }),
+        settingsButton(picking ? tr('picker.opening') : tr('picker.browse'), pick, disabled || picking))
     }
 
     async function saveDirectoryMapping(input, confirm, machines) {
-      const send = data => apiRaw('POST', '/dsh-remote/mappings', { ...data, action: 'save' })
+      const send = data => apiRaw('POST', '/dsh-remote/mappings', { ...data, action: 'save' }, AbortSignal.timeout(WORKSPACE_SETUP_TIMEOUT_MS))
       let result = await send(input)
       const old = result.data.conflict
       if (!input.id && result.status === 409 && old && result.data.replaceable) {
@@ -1531,8 +1551,9 @@ window.__ModuleLoader__.load({
       const { open, busy, onPicked, onCancel, initialMachineId, registerWorkspace } = props
       const [mapLocal, setMapLocal] = React.useState(false)
       const [mappedPath, setMappedPath] = React.useState('')
-      const [mappingBusy, setMappingBusy] = React.useState(false)
-      const mappingConfirm = useConfirm()
+      const [setupPhase, setSetupPhase] = React.useState('')
+      const mappingBusy = !!setupPhase
+      const mappingConfirm = useConfirm(true)
       const [tab, setTab] = React.useState('local')
       const [machineList, setMachineList] = React.useState({ machines: [], sshHosts: [], loading: true, error: '' })
       const { machines, sshHosts, loading: machinesLoading, error: machinesError } = machineList
@@ -1627,12 +1648,15 @@ window.__ModuleLoader__.load({
         return { path: real, platform: res?.platform === 'windows', all: sortItems(list) }
       }
 
-      const loadLevels = (id, p, toIndex) => {
+      const loadLevels = async (id, p, toIndex) => {
         if (!id) return
         const seq = ++levelsSeqRef.current
         setLoading(true); setErr('')
-        fetchDirList(id, p || '')
-        .then((node) => {
+        try {
+          const dir = p ?? (await api('POST', '/dsh-remote/home', { machineId: id }, AbortSignal.timeout(WORKSPACE_SETUP_TIMEOUT_MS))).home
+          if (seq !== levelsSeqRef.current) return
+          if (p === null && !dir) throw new Error(tr('picker.homeUnavailable'))
+          const node = await fetchDirList(id, dir || '')
           if (seq !== levelsSeqRef.current) return
           setWin(node.platform)
           const level = { path: node.path, all: node.all }
@@ -1643,9 +1667,11 @@ window.__ModuleLoader__.load({
             base[idx] = level
             return base.slice(0, idx + 1)
           })
-        })
-        .catch((e) => { if (seq === levelsSeqRef.current) setErr(String((e && e.message) || e)) })
-        .finally(() => { if (seq === levelsSeqRef.current) setLoading(false) })
+        } catch (error) {
+          if (seq === levelsSeqRef.current) setErr(error.name === 'TimeoutError' && p === null ? tr('picker.homeUnavailable') : error.message)
+        } finally {
+          if (seq === levelsSeqRef.current) setLoading(false)
+        }
       }
 
       React.useEffect(() => {
@@ -1658,7 +1684,7 @@ window.__ModuleLoader__.load({
         setErr(''); setLoading(false); setMachineId('')
         setMachineList({ machines: [], sshHosts: [], loading: true, error: '' })
         setImportingMachine(false)
-        setMapLocal(false); setMappedPath('')
+        setMapLocal(false); setMappedPath(''); setSetupPhase('')
         setLocalPop(null); setNewDirName(''); setMkdirPrompt(false); setPopOpen(false)
         postedCurrentRef.current = ''
         Promise.allSettled([
@@ -1723,7 +1749,7 @@ window.__ModuleLoader__.load({
       }
 
       const switchTab = (t) => {
-        if (pickerSessionRef.current?.importing) return
+        if (mappingBusy || pickerSessionRef.current?.importing) return
         closeBrowser()
         setTab(t); setErr('')
         // each tab keeps its own path — never leak the other tab's selection
@@ -1735,10 +1761,10 @@ window.__ModuleLoader__.load({
         const t = String(p || '')
         if (!t || t === '/') return null
         const win = /^[a-zA-Z]:/.test(t)
-        if (win && /^[a-zA-Z]:\\?$/.test(t)) return null // drive root: no parent
+        if (win && /^[a-zA-Z]:\\?$/.test(t)) return '/' // drive list
         const sep = win ? '\\' : '/'
         const idx = t.lastIndexOf(sep)
-        if (idx <= 0) return null
+        if (idx < 0) return null
         const par = t.slice(0, idx)
         if (win && /^[a-zA-Z]:$/.test(par)) return par + '\\'
         return par || '/'
@@ -1761,7 +1787,14 @@ window.__ModuleLoader__.load({
         if (!last) return
         if (levels.length > 1) { setLevels((p) => p.slice(0, p.length - 1)); return }
         const par = parentOf(last.path)
-        if (par) loadLevels(machineId, par, 1)
+        if (par) loadLevels(machineId, par, 0)
+      }
+
+      const jumpToDir = p => {
+        if (loading) return
+        const cut = levels.findIndex(level => level.path === p)
+        if (cut >= 0) setLevels(levels.slice(0, cut + 1))
+        else loadLevels(machineId, p || '/', 0)
       }
 
       const closeBrowser = () => {
@@ -1771,11 +1804,11 @@ window.__ModuleLoader__.load({
         setPopOpen(false)
       }
 
-      const openBrowser = () => {
+      const openBrowser = p => {
         if (!machineId) return
         setLevels(null)
         setPopOpen(true)
-        loadLevels(machineId, path.trim(), 0)
+        loadLevels(machineId, p, 0)
       }
 
       const selectMachine = machine => {
@@ -1812,30 +1845,34 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const commitPath = (p) => {
+      const commitPath = async (p) => {
+        const session = pickerSessionRef.current
         const target = String(p || '').trim()
-        if (!target || !machineId || busy || mappingBusy || (mapLocal && !mappedPath.trim())) return
-        const openWorkspace = async mapping => {
+        if (!session || session.opening || !target || !machineId || busy || (mapLocal && !mappedPath.trim())) return
+        session.opening = true
+        setSetupPhase(mapLocal ? 'picker.savingMapping' : 'picker.openingWorkspace')
+        setErr('')
+        closeBrowser()
+        try {
+          const mapping = mapLocal
+            ? await saveDirectoryMapping({ machineId, remotePath: target, localPath: mappedPath }, mappingConfirm.ask, machines)
+            : null
+          if (pickerSessionRef.current !== session || (mapLocal && !mapping)) return
+          setSetupPhase('picker.openingWorkspace')
           const res = await api('POST', '/dsh-remote/mirror', {
             path: target, machineId, registerWorkspace: registerWorkspace !== false,
             ...(mapping ? { mappingId: mapping.id, mappingRevision: mapping.revision } : {}),
-          })
+          }, AbortSignal.timeout(WORKSPACE_SETUP_TIMEOUT_MS))
+          if (pickerSessionRef.current !== session) return
           if (!res.localMirror) throw new Error(res.error || tr('picker.chooseMachineFirst'))
-          await refreshMirrors()
+          void refreshMirrors()
           onPicked(res.localMirror, res.path || target)
+        } catch (error) {
+          if (pickerSessionRef.current === session) setErr(error.name === 'TimeoutError' ? tr('picker.setupTimeout') : error.message)
+        } finally {
+          session.opening = false
+          if (pickerSessionRef.current === session) setSetupPhase('')
         }
-        setMappingBusy(true); setErr('')
-        closeBrowser()
-        if (mapLocal) {
-          saveDirectoryMapping({ machineId, remotePath: target, localPath: mappedPath }, mappingConfirm.ask, machines)
-            .then(mapping => { if (mapping) return openWorkspace(mapping) })
-            .catch(error => setErr(error.message))
-            .finally(() => setMappingBusy(false))
-          return
-        }
-        openWorkspace()
-          .catch((e) => setErr(String((e && e.message) || e)))
-          .finally(() => setMappingBusy(false))
       }
 
       const acceptBrowserPick = (p) => {
@@ -1951,7 +1988,7 @@ window.__ModuleLoader__.load({
         return React.createElement('div', { style: { border: '1px solid ' + T.borderStrong, borderRadius: 10, background: v('--dsw-alias-bg-overlay', '#1e1e1e'), boxShadow: '0 8px 32px rgba(0,0,0,0.4)', display: 'flex', flexDirection: 'column', maxHeight: 'min(300px, 46vh)', overflow: 'hidden' } },
           React.createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'center', padding: '6px 10px', borderBottom: '1px solid ' + T.border } },
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: goUp, disabled: loading || (levels.length <= 1 && !parentOf(last.path)) }, tr('picker.back')),
-            React.createElement('div', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, breadcrumb(!!machineId, last.path, win, (p) => setLevels((prev) => { const cut = (prev || []).findIndex((lv) => lv.path === p); return cut >= 0 ? prev.slice(0, cut + 1) : prev }))),
+            React.createElement('div', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, breadcrumb(!!machineId, last.path, win, jumpToDir)),
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: mkdirHere, disabled: loading || !last.path || !machineId }, tr('picker.newDir')),
             React.createElement('button', { style: { ...buttonS, padding: '2px 8px' }, onClick: closeBrowser }, tr('picker.closeBtn')),
           ),
@@ -2075,9 +2112,10 @@ window.__ModuleLoader__.load({
                     if (!popOpen) commitPath(path)
                   },
                   placeholder: machineId ? tr(win ? 'picker.pathPlaceholderWin' : 'picker.pathPlaceholder') : tr('picker.chooseMachineFirst'),
-                  disabled: !machineId, style: { ...inputS, flex: 1, minWidth: 120 },
+                  disabled: !machineId || mappingBusy, style: { ...inputS, flex: 1, minWidth: 120 },
                 }),
-                React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: openBrowser, disabled: !machineId }, tr('picker.browse')),
+                React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: () => openBrowser(path.trim()), disabled: !machineId || mappingBusy }, tr('picker.browse')),
+                React.createElement('button', { type: 'button', className: 'dsh-rw-btn', style: { ...buttonS, whiteSpace: 'nowrap' }, onClick: () => openBrowser(null), disabled: !machineId || mappingBusy }, tr('picker.browseHome')),
               ),
               popOpen ? renderDirPopup() : null,
               err ? React.createElement('div', { style: { color: T.danger, fontSize: 12 } }, err) : null,
@@ -2085,11 +2123,11 @@ window.__ModuleLoader__.load({
                 h('input', { type: 'checkbox', checked: mapLocal, onChange: e => setMapLocal(e.target.checked), disabled: mappingBusy }),
                 tr('mapping.check')) : null,
               mapLocal && registerWorkspace !== false ? h(LocalMappingDirectory, {
-                value: mappedPath, onChange: setMappedPath, onError: setErr,
+                value: mappedPath, onChange: setMappedPath, onError: setErr, disabled: mappingBusy,
               }) : null,
               React.createElement('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', alignItems: 'center' } },
                 React.createElement('span', { style: { fontSize: 11, opacity: 0.75, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, path ? tr('picker.selected', { path }) : ''),
-                React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => commitPath(path), disabled: busy || mappingBusy || !machineId || !path.trim() || (mapLocal && !mappedPath.trim()) }, busy || mappingBusy ? tr('picker.mirroring') : tr('picker.setRemoteWs')),
+                React.createElement('button', { type: 'button', className: 'dsh-rw-btn dsh-rw-primary', style: primaryBtnS, onClick: () => commitPath(path), disabled: busy || mappingBusy || !machineId || !path.trim() || (mapLocal && !mappedPath.trim()) }, tr(setupPhase || (busy ? 'picker.openingWorkspace' : 'picker.setRemoteWs'))),
               ),
             ),
         React.createElement('div', { style: { fontSize: 11, opacity: 0.55, paddingTop: 8 } }, tr('picker.hintKeys')),

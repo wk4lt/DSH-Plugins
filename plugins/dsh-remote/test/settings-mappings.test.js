@@ -193,17 +193,25 @@ test('settings delete saved connections after confirmation and identify SSH conf
   }
 })
 
-test('remote picker opens a remote workspace anchor for the chosen checkout', async () => {
+test('remote picker can cancel or confirm changing the target of a mapped checkout', async () => {
   const requests = []
   const picked = []
+  const previous = { ...mappings[0], revision: 'previous', remotePath: '/home/me/old' }
+  let finishBindings
+  const bindings = new Promise(resolve => { finishBindings = resolve })
   const ui = mountClient({ fetch: async (url, opts) => {
     const route = url.split('?')[0]
     if (route.endsWith('/machines')) return response({ machines: [machine], currentId: 'dev' })
     if (route.endsWith('/ssh-config')) return response({ entries: [] })
     if (route.endsWith('/current')) return response({ ok: true })
+    if (route.endsWith('/bindings')) return bindings
     if (route.endsWith('/ls')) return response({ path: '/', items: [], platform: 'posix' })
     if (route.endsWith('/mappings')) {
-      requests.push(JSON.parse(opts.body))
+      const request = JSON.parse(opts.body)
+      requests.push(request)
+      if (!request.id) return {
+        ok: false, status: 409, json: async () => ({ conflict: previous, replaceable: true }),
+      }
       return response({ ok: true, mapping: mappings[0] })
     }
     if (route.endsWith('/mirror')) {
@@ -228,23 +236,39 @@ test('remote picker opens a remote workspace anchor for the chosen checkout', as
     localField.props.onChange(mappings[0].localPath)
     const remoteField = ui.inputs(tree).find(input => input.placeholder?.includes('远程路径'))
     remoteField.onChange({ target: { value: mappings[0].remotePath } })
-    tree = await render()
-    ui.button(tree, /^设为远程工作区$/).el.props.onClick()
-    await ui.tick()
+    const remap = async accepted => {
+      const pending = ui.button(await render(), /^设为远程工作区$/).el.props.onClick()
+      await ui.tick()
+      const waiting = await render()
+      assert.equal(ui.button(waiting, /^正在保存映射…$/).disabled, true)
+      const dialog = ui.components(waiting).find(node => node.type.name === 'ConfirmDialog')
+      assert.equal(dialog.props.abovePicker, true)
+      dialog.props.onAnswer(accepted)
+      await pending
+    }
+    await remap(false)
+    assert.deepEqual(picked, [])
+    await remap(true)
+    const save = { machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' }
     assert.deepEqual(requests, [
-      { machineId: 'dev', remotePath: mappings[0].remotePath, localPath: mappings[0].localPath, action: 'save' },
+      save,
+      save,
+      { ...save, id: previous.id, revision: previous.revision },
       { machineId: 'dev', path: mappings[0].remotePath, mappingId: 'a', mappingRevision: '1', registerWorkspace: true },
     ])
     assert.deepEqual(picked, [['D:\\dsh\\remote-workspaces\\dev\\api-mapped', mappings[0].remotePath]])
   } finally {
+    finishBindings(response({ mirrors: [] }))
     ui.dispose()
   }
 })
 
 test('remote paths are typed or selected through Browse', async () => {
   const listings = []
+  const homeRequests = []
   const submitted = []
   const picked = []
+  let timedOut = true
   const ui = mountClient({ fetch: async (url, opts) => {
     const request = new URL(url, 'http://localhost')
     if (request.pathname.endsWith('/machines')) {
@@ -252,6 +276,10 @@ test('remote paths are typed or selected through Browse', async () => {
     }
     if (request.pathname.endsWith('/ssh-config')) return response({ entries: [] })
     if (request.pathname.endsWith('/current')) return response({ ok: true })
+    if (request.pathname.endsWith('/home')) {
+      homeRequests.push(JSON.parse(opts.body))
+      return response({ home: '/home/fixture user' })
+    }
     if (request.pathname.endsWith('/bindings')) return response({ mirrors: [] })
     if (request.pathname.endsWith('/ls')) {
       const path = request.searchParams.get('path')
@@ -259,6 +287,8 @@ test('remote paths are typed or selected through Browse', async () => {
       return response({ path: path || '/', items: [], platform: 'posix' })
     }
     if (request.pathname.endsWith('/mirror')) {
+      assert(opts.signal)
+      if (timedOut) throw new DOMException('request timed out', 'TimeoutError')
       const { path } = JSON.parse(opts.body)
       submitted.push(path)
       return response({ path, localMirror: '/workspace' })
@@ -273,7 +303,7 @@ test('remote paths are typed or selected through Browse', async () => {
     let tree = await render()
     ui.button(tree, /^远程$/).el.props.onClick()
     tree = await render()
-    assert.doesNotMatch(ui.text(tree), /最近:|主目录|recent-project/)
+    assert.doesNotMatch(ui.text(tree), /最近:|~ 主目录|recent-project/)
     assert.equal(input(tree).autoComplete, 'off')
 
     input(tree).onChange({ target: { value: '/projects/alpha' } })
@@ -281,6 +311,12 @@ test('remote paths are typed or selected through Browse', async () => {
     await ui.tick()
     tree = await render()
     assert.deepEqual(listings, [])
+    input(tree).onKeyDown({ key: 'Enter', preventDefault() {} })
+    await ui.tick()
+    tree = await render()
+    assert.match(ui.text(tree), /打开远程工作区超时/)
+    assert.equal(ui.button(tree, /^设为远程工作区$/).disabled, false)
+    timedOut = false
     input(tree).onKeyDown({ key: 'Enter', preventDefault() {} })
     await ui.tick()
     assert.deepEqual(submitted, ['/projects/alpha'])
@@ -292,6 +328,14 @@ test('remote paths are typed or selected through Browse', async () => {
     assert.deepEqual(listings, ['/projects/alpha'])
     ui.button(tree, /^选用此路径$/).el.props.onClick()
     assert.equal(input(await render()).value, '/projects/alpha')
+
+    ui.button(await render(), /^从主目录浏览$/).el.props.onClick()
+    await ui.tick()
+    tree = await render()
+    assert.deepEqual(homeRequests, [{ machineId: 'dev' }])
+    assert.deepEqual(listings, ['/projects/alpha', '/home/fixture user'])
+    ui.button(tree, /^选用此路径$/).el.props.onClick()
+    assert.equal(input(await render()).value, '/home/fixture user')
   } finally {
     ui.dispose()
   }
