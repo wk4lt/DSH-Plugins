@@ -24,7 +24,7 @@ import {
 /** 动作菜单项（顺序即渲染顺序）。 */
 const MENU_ACTIONS = ['connect', 'workspace', 'workspaces', 'edit', 'delete', 'probe', 'browse']
 /** 表单里永远出现的字段。 */
-const BASE_FORM_FIELDS = ['name', 'host', 'useSshConfig', 'port', 'username', 'auth']
+const BASE_FORM_FIELDS = ['name', 'host', 'port', 'username', 'auth']
 
 /** 取错误对象里面向用户的一句话。 */
 function messageOf(error) {
@@ -659,12 +659,6 @@ export function createSceneComponent({ api, config, i18n, notify } = {}) {
       }
       const field = fields[bounded]
       if (!field) return
-      if (field === 'useSshConfig') {
-        if (input === ' ' || key.leftArrow || key.rightArrow) {
-          setForm((previous) => ({ ...previous, useSshConfig: !(previous && previous.useSshConfig) }))
-        }
-        return
-      }
       if (field === 'auth') {
         if (input === ' ' || key.leftArrow || key.rightArrow) {
           const auth = nextAuth(form.auth, key.leftArrow ? -1 : 1)
@@ -794,7 +788,7 @@ export function createSceneComponent({ api, config, i18n, notify } = {}) {
             h(Text, { bold: focused || current }, clip(machineName(machine), Math.max(8, Math.floor(columns * 0.32)))),
             h(Text, { dimColor: true }, clip(`  ${machineAddress(machine)}`, Math.max(10, Math.floor(columns * 0.3)))),
             machine.group ? h(Text, { color: 'subtle' }, clip(`  [${machine.group}]`, 16)) : null,
-            machine.useSshConfig ? h(Text, { color: 'subtle' }, '  ssh-config') : null,
+            machine.useSshConfig ? h(Text, { color: 'subtle' }, '  ' + t('list.legacySshAlias')) : null,
             h(Box, { flexGrow: 1 }),
             h(Text, { color: 'subtle' }, machine.workspace ? clip(basenameRemote(machine.workspace), 18) : ''),
           ))
@@ -821,7 +815,6 @@ export function createSceneComponent({ api, config, i18n, notify } = {}) {
 
     function formValueText(field) {
       if (!form) return ''
-      if (field === 'useSshConfig') return form.useSshConfig ? '[x]' : '[ ]'
       if (field === 'auth') return `◂ ${t('auth.' + form.auth)} ▸`
       if (field === 'password') {
         const masked = maskValue(form.password)
@@ -854,7 +847,7 @@ export function createSceneComponent({ api, config, i18n, notify } = {}) {
         children.push(h(Box, { key: field, flexDirection: 'row', width: '100%' },
           h(Text, { color: focused ? 'accent' : 'subtle', bold: focused }, `${focused ? '› ' : '  '}${label}: `),
           h(Text, { inverse: focused, color: focused ? 'accent' : undefined },
-            clip(value + (focused && field !== 'useSshConfig' && field !== 'auth' ? '▌' : ''), Math.max(8, columns - 18))),
+            clip(value + (focused && field !== 'auth' ? '▌' : ''), Math.max(8, columns - 18))),
         ))
       })
       return h(Box, { key: 'body', flexDirection: 'column', width: '100%', paddingX: 1 }, ...children)

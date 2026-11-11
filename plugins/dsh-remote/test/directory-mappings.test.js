@@ -6,9 +6,10 @@ import { zstdCompressSync } from 'node:zlib'
 import { Context } from '@deepseek-ai/cordis'
 import { SystemPrompt, renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
 import ssh2 from 'ssh2'
+import { baseSshArgs } from '../lib/openssh.js'
+import { ensurePrivateSshConfig } from '../lib/private-ssh-config.cjs'
 import { createHost, machine } from './harness/plugin-host.js'
 import { startFakeSsh } from './harness/fake-ssh.js'
-import { mountClient } from './harness/render.js'
 import shell from '../lib/remote-shell-child.cjs'
 
 test('picker mkdir creates one directory on the selected server and reports SFTP failures', { timeout: 15000 }, async t => {
@@ -66,10 +67,12 @@ test('picker mkdir creates one directory on the selected server and reports SFTP
   assert.equal(selected.fs.has('/projects/denied'), false)
 })
 
-test('the workspace picker lists SSH config aliases and saves only the selected host', { timeout: 5000 }, async t => {
+test('SSH aliases are imported explicitly and connections use saved settings', { timeout: 10000 }, async t => {
   const ssh = await startFakeSsh({ fs: { '/projects/app/readme.txt': 'fixture' } })
   t.after(() => ssh.close())
-  const host = await createHost()
+  const normal = machine(ssh.machine({ id: 'normal', username: 'fixture' }))
+  const legacy = machine({ id: 'legacy', host: 'vscode-dev', username: 'fixture', useSshConfig: true, workspace: '/projects/app' })
+  const host = await createHost({ machines: [normal, legacy] })
   t.after(() => host.dispose())
   const previous = process.env.DSH_REMOTE_SSH_CONFIG
   const sshConfig = path.join(host.home, 'ssh-config')
@@ -83,42 +86,60 @@ test('the workspace picker lists SSH config aliases and saves only the selected 
   assert.equal((await host.call('/dsh-remote/machines', { body: importHost })).status, 404)
   const keyFile = path.join(host.home, 'fixture-key')
   writeFileSync(keyFile, ssh2.utils.generateKeyPairSync('ed25519').private, { mode: 0o600 })
-  const contents = `Host vscode-dev vscode-other\n  HostName 127.0.0.1\n  User fixture\n  Port ${ssh.port}\n  IdentityFile "${keyFile}"\n`
+  const contents = [
+    'Host 127.0.0.1', '  HostName 192.0.2.2', '  Port 1',
+    'Host vscode-dev vscode-other', '  HostName 127.0.0.1', '  User fixture',
+    '  Port ' + ssh.port, '  IdentityFile "' + keyFile + '"', '',
+    'Host command-proxy', '  ProxyCommand arbitrary-config-command', '',
+  ].join('\n')
   writeFileSync(sshConfig, contents)
 
-  let reportListing
-  const listing = new Promise(resolve => { reportListing = resolve })
-  const ui = mountClient({ fetch: async (url, opts) => {
-    const route = url.split('?')[0]
-    const result = await host.call(route, { method: opts.method, url, body: opts.body ? JSON.parse(opts.body) : {} })
-    if (route === '/dsh-remote/ls') reportListing(result)
-    return { ok: result.status === 200, status: result.status, json: async () => result.json }
-  } })
-  t.after(() => ui.dispose())
-  const picker = ui.component('sidebar.workspaces.directoryFlow')
-  const render = () => ui.settleComponent(picker, { open: true, onPicked() {}, onCancel() {} })
-  const select = tree => ui.elements(tree).find(node => node.type === 'select')
-  const options = tree => ui.elements(select(tree)).filter(node => node.type === 'option').map(node => node.props.value)
-  let tree = await render()
-  ui.button(tree, /^远程$/).el.props.onClick()
-  tree = await render()
-  assert.deepEqual(options(tree), ['', 'ssh:vscode-dev', 'ssh:vscode-other'])
-  assert.deepEqual(host.readMachines(), [])
-
-  await select(tree).props.onChange({ target: { value: 'ssh:vscode-dev' } })
-  tree = await render()
-  const [saved, ...others] = host.readMachines()
-  assert.equal(saved.host, 'vscode-dev')
-  assert.equal(saved.useSshConfig, true)
-  assert.deepEqual(others, [])
-  assert.equal(host.readRegistry().currentId, saved.id)
-  assert.equal(select(tree).props.value, 'machine:' + saved.id)
-  assert.deepEqual(options(tree), ['', 'machine:' + saved.id, 'ssh:vscode-other'])
+  const listDir = id => host.call('/dsh-remote/ls', { method: 'GET', url: '/dsh-remote/ls?path=/projects&machineId=' + id })
+  assert.equal((await listDir('legacy')).status, 409)
+  assert.equal((await listDir('normal')).status, 200)
+  const unsupported = await host.call('/dsh-remote/machines', { body: { ...importHost, alias: 'command-proxy' } })
+  assert.equal(unsupported.status, 422)
+  assert.equal(host.readMachines().length, 2)
+  const probe = await host.call('/dsh-remote/test-connect', { body: { id: 'normal' } })
+  assert.equal(probe.json.ok, true, probe.raw)
+  const currentId = host.readRegistry().currentId
+  const imported = await host.call('/dsh-remote/machines', { body: importHost })
+  assert.equal(imported.status, 200, imported.raw)
+  const saved = host.readMachines().find(item => item.id === 'legacy')
+  assert.equal(saved.host, '127.0.0.1')
+  assert.equal(saved.port, ssh.port)
+  assert.equal(saved.username, 'fixture')
+  assert.equal(saved.privateKeyPath, keyFile)
+  assert.equal(saved.workspace, '/projects/app')
+  assert.equal(saved.useSshConfig, undefined)
+  assert.equal(host.readRegistry().currentId, currentId)
   assert.equal(readFileSync(sshConfig, 'utf8'), contents)
-  ui.button(tree, /^浏览…$/).el.props.onClick()
-  const listed = await listing
-  assert.equal(listed.status, 200, listed.raw)
-  assert(listed.json.items.some(entry => entry.name === 'projects'))
+
+  const changed = contents.replace('HostName 127.0.0.1', 'HostName 192.0.2.3')
+  writeFileSync(sshConfig, changed)
+  const listing = await listDir('legacy')
+  assert.equal(listing.status, 200, listing.raw)
+  assert(listing.json.items.some(entry => entry.name === 'app'))
+  const anchor = path.join(path.dirname(host.registryFile), 'legacy-host', 'app')
+  mkdirSync(anchor, { recursive: true })
+  writeFileSync(path.join(anchor, '.dsh-remote-meta.json'), JSON.stringify({
+    machineId: legacy.id, alias: legacy.host, host: saved.host, port: saved.port, username: saved.username, remotePath: '/projects/app',
+  }))
+  const workspace = shell.resolveTarget({ cwd: anchor, machines: host.registryFile })
+  assert.equal(workspace.machine.id, legacy.id)
+  const sshConfigFile = ensurePrivateSshConfig(path.dirname(host.registryFile))
+  const sharedArgs = ['-F', sshConfigFile, '-o', 'HostName=127.0.0.1', '-p', String(ssh.port), '-l', 'fixture', '-i', keyFile]
+  assert.deepEqual(baseSshArgs({ ...saved, sshConfigFile }).slice(0, sharedArgs.length), sharedArgs)
+  assert.deepEqual(shell.buildSshArgs(workspace.target, workspace.machine, sshConfigFile).slice(1, sharedArgs.length + 1), sharedArgs)
+  const files = await host.tool('rw_list_dir').execute({}, { agent: { session: { header: { cwd: anchor } } } })
+  assert.match(files.text, /readme\.txt/)
+  const edited = await host.call('/dsh-remote/machines', { body: { action: 'update', id: 'legacy', host: saved.host, port: saved.port, username: saved.username } })
+  assert.equal(edited.status, 200, edited.raw)
+  assert.equal(readFileSync(sshConfig, 'utf8'), changed)
+  const deleted = await host.call('/dsh-remote/machines', { body: { action: 'delete', id: 'legacy' } })
+  assert.equal(deleted.status, 200, deleted.raw)
+  assert.deepEqual(deleted.json.machines.map(item => item.id), ['normal'])
+  assert.equal(readFileSync(sshConfig, 'utf8'), changed)
 })
 
 test('explicit mappings route existing checkouts and preserve the mirror workflow', async () => {

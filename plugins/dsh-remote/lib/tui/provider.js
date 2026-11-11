@@ -71,7 +71,7 @@ export function matchMachineForMirror(machines, mirrorMachine) {
   if (!mirrorMachine) return undefined
   const alias = String(mirrorMachine.alias || '')
   if (alias) {
-    const byAlias = list.find((m) => m && m.useSshConfig && String(m.host || '') === alias)
+    const byAlias = list.find((m) => m && (m.importedSshAlias === alias || (m.useSshConfig && m.host === alias)))
     if (byAlias) return byAlias
   }
   const host = String(mirrorMachine.host || '')
@@ -136,20 +136,7 @@ export function createWorkspaceProvider({ api, config, logger, root, onDescribe,
       const direct = state.machines.find((m) => String(m.id || '') === String(project.machineId))
       if (direct) return direct
     }
-    const alias = String(project.alias || '')
-    if (alias) {
-      const byAlias = state.machines.find((m) => m.useSshConfig && String(m.host || '') === alias)
-      if (byAlias) return byAlias
-    }
-    const host = String(project.host || '')
-    const port = Number(project.port) || 22
-    const user = String(project.username || '')
-    return state.machines.find((m) => {
-      if (m.useSshConfig) return false
-      if (String(m.host || '') !== host) return false
-      if ((Number(m.port) || 22) !== port) return false
-      return !user || String(m.username || '') === user
-    })
+    return matchMachineForMirror(state.machines, project)
   }
 
   /** resolveMirror 的 machine 段（meta）→ 保存的机器。 */

@@ -104,16 +104,11 @@ window.__ModuleLoader__.load({
         'mapping.removeConfirm': '解除 {local} 的远端绑定？',
         'mapping.replace': '将 {local} 的远端目标从 {old} 改为 {next}？',
         'settings.title': '远程工作区（dsh-remote）',
-        'settings.intro': '下面直接列出 ~/.ssh/config 里的机器：点「连接」，再选一个远程目录就能开始。要加机器，点「打开配置文件」编辑这个文件，改完点「刷新」。',
-        'settings.noMachines': '还没有保存的机器 —— 上面列出的是 ~/.ssh/config 里的主机，点「连接」即可。',
         // ── issue #73：首屏就是 ssh 配置里的主机列表（像 VSCode Remote-SSH）──
         'settings.pickHost': '选择远程机器',
-        'settings.hostListSource': '来自 ~/.ssh/config',
-        'settings.hostListLoading': '正在读取 ~/.ssh/config…',
         'settings.hostListRefresh': '刷新',
         'settings.refreshing': '刷新中…',
         'settings.refreshed': '已刷新服务器和目录映射。',
-        'settings.hostListRefreshHint': '重新读取 ~/.ssh/config（改完文件点这里，不用重开设置页）',
         'settings.hostListEmpty': '没在 {file} 里找到主机。写好 Host 段后点「刷新」。',
         'settings.hostListFailed': '读取失败：{msg}。这不是你的 ssh 配置有问题（文件根本没读到）——点「刷新」重试；一直失败说明插件版本与服务端不一致，重启 DSH 即可。',
         'settings.hostConnect': '连接',
@@ -121,10 +116,7 @@ window.__ModuleLoader__.load({
         'settings.hostConnectHint': '连上并设为当前机器（之后就能选远程目录）',
         'settings.hostConnected': '已连接 · {latency}',
         'settings.hostConnectedHint': '已连接，选择要打开的远程目录即可开始工作。',
-        'settings.openSshConfig': '打开配置文件',
-        'settings.openSshConfigHint': '用本机编辑器打开 ~/.ssh/config。改完点「刷新」，新的 Host 会出现在列表里。',
-        'settings.sshConfigOpened': '已打开：{file}',
-        'settings.sshConfigOpenFailed': '无法自动打开（{msg}）——可以直接编辑这个文件：{file}',
+        'settings.openSshConfig': '打开插件 SSH 配置',
         'settings.badgeKey': '私钥',
         'settings.openWorkspace': '选目录',
         'settings.openWorkspaceHint': '在这台机器上选一个远程目录作为工作区',
@@ -144,7 +136,6 @@ window.__ModuleLoader__.load({
         'settings.current': '当前',
         'settings.edit': '编辑',
         'settings.delete': '删除',
-        'settings.sshConfigSource': '来自 SSH 配置',
         'settings.currentMachine': '当前远程机：{name}',
         'settings.clearCurrent': '取消设为当前（active remote = none）',
         'settings.noActive': '当前没有活动远程机：保存的机器只是备用连接，不会自动进入会话上下文（本地会话不受影响）。',
@@ -156,8 +147,7 @@ window.__ModuleLoader__.load({
         'settings.backend': '连接后端',
         'settings.backendNative': 'native（内置 ssh2：密码 / 私钥 / agent / 动态码）',
         'settings.backendOpenssh': 'openssh（调用本机 ssh 命令）',
-        'settings.backendOpensshHint': '调用本机 ssh，因此完全遵循 ~/.ssh/config：支持 GSSAPI/Kerberos（kinit 后免密登录）、ProxyCommand、PKCS11Provider、Match 等 OpenSSH 专有特性；主机密钥由 ssh 用你自己的 known_hosts 校验。代价是每条命令都要新建一次连接（比 native 慢），文件浏览（SFTP）仍保持长连接。',
-        'settings.backendOpensshAliasOk': '已勾选「使用 ssh_config 别名」：主机名原样交给 ssh，端口/用户/私钥/跳板机一律由 ~/.ssh/config 的 Host 块决定，对应的输入框在 openssh 后端下填了也不生效（这就是「配置唯一来源」，issue #50）。密码/Passphrase 仍会通过 askpass 交给 ssh，仅当 Host 块里没有可用认证时才用得上。',
+        'settings.backendOpensshHint': '本机 OpenSSH 使用插件 SSH 配置。可在该文件中设置 Kerberos 等 OpenSSH 专属选项。',
         'settings.sshBinary': 'ssh 路径',
         'settings.sshBinaryPlaceholder': '留空 = 用 PATH 里的 ssh',
         // Issue #54: the README told users to point `webAttachCommand` at a
@@ -165,12 +155,11 @@ window.__ModuleLoader__.load({
         // it could only be written by the deploy flow or by hand-editing
         // machines.json. It is an ordinary per-machine field now.
         'settings.sshImport': '从 ~/.ssh/config 导入',
-        'settings.useSshConfig': 'Host 名来自 ~/.ssh/config（主机栏填 Host 名即可）',
-        'settings.useSshConfigHint': '连的时候会按 ~/.ssh/config 里这个 Host 的实际配置去连（用户/端口/私钥/跳板机都从文件读，改文件就生效）；这里留空即可。',
-        'settings.saveWritesSshConfig': '保存时会把 主机/用户/端口/私钥 写入 ~/.ssh/config 的受管块（# dsh-remote: managed 标记）；此后该文件优先——直接改它立即生效。',
-        'settings.sshResolvedTo': '→ {user}@{host}:{port}',
-        'settings.sshResolvedNone': '~/.ssh/config 中没有匹配「{alias}」的 Host 条目',
-        'settings.sshResolvedWarn': '注意：{msg}',
+        'settings.sshImportAlias': 'SSH 别名',
+        'settings.sshImportHint': '选中的连接参数会保存到 DSH。同名的已保存连接会更新。',
+        'settings.sshImportEmpty': 'SSH 配置中没有可导入的主机。',
+        'settings.sshImported': '已导入「{name}」',
+        'settings.sshImportRequired': '旧 SSH 别名需要导入或填写实际连接参数',
         'settings.sshAliasSaved': '已按别名保存（连接时解析）',
         'settings.name': '名称',
         'settings.host': '主机',
@@ -274,9 +263,7 @@ window.__ModuleLoader__.load({
         'picker.remoteMachine': '远程机器:',
         'picker.chooseMachine': '— 选择机器 —',
         'picker.noMachines': '还没有机器，请先在设置里添加',
-        'picker.sshConfigMachines': 'SSH 配置中的主机',
         'picker.machineListFailed': '读取远程机器失败：{msg}',
-        'picker.importMachineFailed': '无法添加 SSH 主机 {alias}',
         'picker.pathPlaceholder': '输入远程路径',
         'picker.pathPlaceholderWin': '输入远程路径，如 C:\\Users\\…',
         'picker.chooseMachineFirst': '先选远程机器',
@@ -400,15 +387,10 @@ window.__ModuleLoader__.load({
         'mapping.removeConfirm': 'Unbind the remote target for {local}?',
         'mapping.replace': 'Change the remote target for {local} from {old} to {next}?',
         'settings.title': 'Remote workspace (dsh-remote)',
-        'settings.intro': 'Your ~/.ssh/config hosts are listed below: click Connect, then pick a remote folder. To add a host, click Open config, edit the file, then Refresh.',
-        'settings.noMachines': 'No saved machines yet — the list above comes from ~/.ssh/config; click 连接 to use one.',
         'settings.pickHost': 'Choose a remote machine',
-        'settings.hostListSource': 'from ~/.ssh/config',
-        'settings.hostListLoading': 'Reading ~/.ssh/config…',
         'settings.hostListRefresh': 'Refresh',
         'settings.refreshing': 'Refreshing…',
         'settings.refreshed': 'Servers and directory mappings refreshed.',
-        'settings.hostListRefreshHint': 'Re-read ~/.ssh/config (no need to reopen this page)',
         'settings.hostListEmpty': 'No hosts found in {file}. Add Host blocks, then hit Refresh.',
         'settings.hostListFailed': 'Could not read it: {msg}. This is NOT a problem with your ssh config (the file was never read) — hit Refresh; if it keeps failing the plugin versions are out of sync, so restart DSH.',
         'settings.hostConnect': 'Connect',
@@ -416,10 +398,7 @@ window.__ModuleLoader__.load({
         'settings.hostConnectHint': 'Connect and make it the current machine (then pick a remote folder)',
         'settings.hostConnected': 'Connected · {latency}',
         'settings.hostConnectedHint': 'Connected — pick the remote folder to start working.',
-        'settings.openSshConfig': 'Open config',
-        'settings.openSshConfigHint': 'Open ~/.ssh/config in your editor. Hit Refresh afterwards and the new Host shows up here.',
-        'settings.sshConfigOpened': 'Opened: {file}',
-        'settings.sshConfigOpenFailed': 'Could not open it automatically ({msg}) — edit this file yourself: {file}',
+        'settings.openSshConfig': 'Open plugin SSH config',
         'settings.badgeKey': 'key',
         'settings.openWorkspace': 'Folder',
         'settings.openWorkspaceHint': 'Pick a remote folder on this machine as the workspace',
@@ -438,7 +417,6 @@ window.__ModuleLoader__.load({
         'settings.current': 'current',
         'settings.edit': 'Edit',
         'settings.delete': 'Delete',
-        'settings.sshConfigSource': 'From SSH config',
         'settings.currentMachine': 'Current remote: {name}',
         'settings.clearCurrent': 'Clear current (active remote = none)',
         'settings.noActive': 'No active remote machine: saved machines are standby connections and never enter a session context automatically (local sessions are unaffected).',
@@ -450,19 +428,17 @@ window.__ModuleLoader__.load({
         'settings.backend': 'Backend',
         'settings.backendNative': 'native (built-in ssh2: password / key / agent / OTP)',
         'settings.backendOpenssh': 'openssh (drive the local ssh command)',
-        'settings.backendOpensshHint': 'Delegates the transport to the local `ssh`, so the whole of ~/.ssh/config applies: GSSAPI/Kerberos (log in once with kinit and no secret is needed), ProxyCommand, PKCS11Provider, Match blocks… Host keys are checked by ssh against your own known_hosts. The cost is a fresh connection per command (slower than native); file browsing over SFTP still reuses one session.',
-        'settings.backendOpensshAliasOk': '"Use a ~/.ssh/config alias" is on: the name is handed to ssh verbatim, and Port/User/IdentityFile/ProxyJump come from that Host block — the matching fields below have no effect (this is the "one source of truth" case, issue #50). A password/passphrase is still offered to ssh through askpass, and is only used if the Host block has no usable authentication.',
+        'settings.backendOpensshHint': 'The local OpenSSH command uses the plugin SSH config. Set OpenSSH-specific options such as Kerberos in that file.',
         'settings.sshBinary': 'ssh path',
         'settings.sshBinaryPlaceholder': 'Empty = the ssh on PATH',
         // Issue #54: the README documented `webAttachCommand` but the settings
         // UI had no field for it.
         'settings.sshImport': 'Import from ~/.ssh/config',
-        'settings.useSshConfig': 'Host name comes from ~/.ssh/config (put the Host name in 主机)',
-        'settings.useSshConfigHint': 'Connecting follows that Host block in ~/.ssh/config (user / port / key / jump host are read from the file, so editing it takes effect). Leave the other fields empty.',
-        'settings.saveWritesSshConfig': 'Saving writes host/user/port/key into a managed block in ~/.ssh/config (marked # dsh-remote: managed); the file then takes precedence — edit it directly and it takes effect at once.',
-        'settings.sshResolvedTo': '→ {user}@{host}:{port}',
-        'settings.sshResolvedNone': 'no ~/.ssh/config block matches "{alias}"',
-        'settings.sshResolvedWarn': 'Heads-up: {msg}',
+        'settings.sshImportAlias': 'SSH alias',
+        'settings.sshImportHint': 'DSH saves the selected connection settings and updates a matching saved connection.',
+        'settings.sshImportEmpty': 'There are no hosts to import from SSH config.',
+        'settings.sshImported': 'Imported {name}',
+        'settings.sshImportRequired': 'Import this legacy SSH alias or enter its connection settings',
         'settings.sshAliasSaved': 'Saved as an alias (resolved on connect)',
         'settings.name': 'Name',
         'settings.host': 'Host',
@@ -562,9 +538,7 @@ window.__ModuleLoader__.load({
         'picker.remoteMachine': 'Remote machine:',
         'picker.chooseMachine': '— choose a machine —',
         'picker.noMachines': 'No machines yet — add one in Settings first',
-        'picker.sshConfigMachines': 'Hosts from SSH config',
         'picker.machineListFailed': 'Could not load remote machines: {msg}',
-        'picker.importMachineFailed': 'Could not add SSH host {alias}',
         'picker.pathPlaceholder': 'Enter remote path',
         'picker.pathPlaceholderWin': 'Enter remote path, e.g. C:\\Users\\…',
         'picker.chooseMachineFirst': 'Choose a remote machine first',
@@ -728,6 +702,7 @@ window.__ModuleLoader__.load({
       '请输入单个目录名，不能包含路径分隔符': 'picker.invalidDirName',
       '请先进入要创建子目录的远程目录': 'picker.mkdirParentRequired',
       '同名文件或目录已存在': 'picker.mkdirAlreadyExists',
+      '请在「远程工作区」设置中导入旧 SSH 别名，或填写实际连接参数。': 'settings.sshImportRequired',
       '无法获取远端 SSH 用户的主目录': 'picker.homeUnavailable',
       '无法连接 npm registry': 'settings.registryUnreachable',
     }
@@ -1076,11 +1051,6 @@ window.__ModuleLoader__.load({
     }, label)
     const machineAddress = ({ username, host, port }) => [username, host].filter(Boolean).join('@') + (port ? ':' + port : '')
 
-    function unsavedSshHosts(machines, hosts) {
-      const savedAliases = new Set(machines.filter(machine => machine.useSshConfig).map(machine => machine.host))
-      return hosts.filter(host => !savedAliases.has(host.alias))
-    }
-
     function SettingsEditor({ title, close, children, footer }) {
       const backdrop = useBackdropGuard()
       const contents = h('div', { style: { width: '100%', minWidth: 0 } },
@@ -1145,7 +1115,7 @@ window.__ModuleLoader__.load({
     function RemoteWorkspacePage() {
       const [machines, setMachines] = React.useState([])
       const [mappings, setMappings] = React.useState([])
-      const [sshHosts, setSshHosts] = React.useState([])
+      const [sshImport, setSshImport] = React.useState(null)
       const [rowState, setRowState] = React.useState({})
       const [refreshing, setRefreshing] = React.useState(false)
       const [refreshStatus, setRefreshStatus] = React.useState('')
@@ -1164,12 +1134,10 @@ window.__ModuleLoader__.load({
         const result = await Promise.all([
           api('GET', '/dsh-remote/machines'),
           api('GET', '/dsh-remote/mappings'),
-          api('GET', '/dsh-remote/ssh-config'),
         ])
         if (seq !== refreshSeq.current) return
         setMachines(result[0].machines || [])
         setMappings(result[1].mappings || [])
-        setSshHosts(result[2].entries || [])
       }
       const reload = () => refresh().catch(error => setErr(error.message))
       const refreshSettings = async () => {
@@ -1200,7 +1168,7 @@ window.__ModuleLoader__.load({
           username: machine.username || '', workspace: machine.workspace || '',
           privateKeyPath: machine.privateKeyPath || '', hostKeyMode: machine.hostKeyMode || '',
           password: '', passphrase: '', encryptPassword: !!(machine.credentialBackend && machine.credentialBackend !== 'plain'),
-          useSshConfig: !!machine.useSshConfig, useAgent: !!machine.useAgent, keyboardInteractive: !!machine.keyboardInteractive,
+          useAgent: !!machine.useAgent, keyboardInteractive: !!machine.keyboardInteractive,
           proxyHost: machine.proxy?.host || '', proxyPort: String(machine.proxy?.port || 22),
           proxyUser: machine.proxy?.username || '', proxyPassword: '', proxyKey: machine.proxy?.privateKeyPath || '',
           proxyPasswordSet: !!machine.proxy?.passwordSet,
@@ -1209,9 +1177,9 @@ window.__ModuleLoader__.load({
       const setF = key => event => setForm(previous => ({ ...previous, [key]: event.target.value }))
       const setFb = key => event => setForm(previous => ({ ...previous, [key]: event.target.checked }))
       const formPayload = () => {
-        const { proxy, sshConfigResolved, connected, ...fields } = form
+        const { proxy, connected, ...fields } = form
         return {
-          ...fields, port: Number(form.port) || 22,
+          ...fields, useSshConfig: false, port: Number(form.port) || 22,
           proxy: form.proxyHost ? {
             host: form.proxyHost, port: Number(form.proxyPort) || 22,
             username: form.proxyUser, password: form.proxyPassword, privateKeyPath: form.proxyKey,
@@ -1235,7 +1203,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await api('POST', '/dsh-remote/test-connect', {
             id: machine.id, host: machine.host, port: machine.port,
-            username: machine.username, useSshConfig: !!machine.useSshConfig,
+            username: machine.username,
           })
           setResult({ text: tr('settings.connOkWith', { user: result.user, host: result.host, latency: result.latencyMs, shell: '' }) })
         } catch (error) {
@@ -1279,6 +1247,36 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const showSshImport = async () => {
+        const pending = { loading: true, alias: '', entries: [], error: '' }
+        setSshImport(pending)
+        setErr('')
+        try {
+          const result = await api('GET', '/dsh-remote/ssh-config')
+          setSshImport(current => current === pending ? { ...pending, loading: false, entries: result.entries || [] } : current)
+        } catch (error) {
+          setSshImport(current => current === pending ? { ...pending, loading: false, error: error.message } : current)
+        }
+      }
+      const closeSshImport = () => { if (!busy) setSshImport(null) }
+      const saveSshImport = async () => {
+        const alias = sshImport?.alias
+        if (!alias || busy) return
+        setBusy(true)
+        setSshImport(current => ({ ...current, error: '' }))
+        try {
+          const result = await api('POST', '/dsh-remote/machines', { action: 'from-ssh-config', alias })
+          refreshSeq.current++
+          setMachines(result.machines)
+          setRefreshStatus(tr('settings.sshImported', { name: result.machine.name || alias }))
+          setSshImport(null)
+        } catch (error) {
+          setSshImport(current => ({ ...current, error: error.message }))
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const showMapping = mapping => { setErr(''); setEditMapping(mapping) }
       const changeMapping = (key, value) => setEditMapping(previous => ({ ...previous, [key]: value }))
       const saveMapping = async () => {
@@ -1312,9 +1310,6 @@ window.__ModuleLoader__.load({
       const banner = text => text ? h('p', { role: 'alert', style: { color: T.danger, overflowWrap: 'anywhere' } }, text) : null
       const closeServer = () => { if (!busy && tst !== 'testing') { setForm(null); setErr('') } }
       const closeMapping = () => { if (!busy) { setEditMapping(null); setErr('') } }
-      const listed = [...machines, ...unsavedSshHosts(machines, sshHosts).map(host => ({
-        name: host.alias, host: host.alias, port: host.port, username: host.user, useSshConfig: true,
-      }))]
       const groups = [...machines, ...[...new Set(mappings.map(mapping => mapping.machineId))]
         .filter(id => !machines.some(machine => machine.id === id))
         .map(id => ({ id, name: tr('mapping.missingServer'), missing: true }))]
@@ -1323,17 +1318,18 @@ window.__ModuleLoader__.load({
       const ellipsisStyle = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
 
       return h('div', { className: 'dsh-rw-settings', style: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 12 } },
-        !form && !editMapping ? banner(err) : null,
+        !form && !editMapping && !sshImport ? banner(err) : null,
         h('section', { style: boxS, 'aria-label': tr('mapping.servers'), 'aria-busy': refreshing },
           h('div', { style: rowStyle },
             h('h3', { style: { flex: 1, margin: 0 } }, tr('mapping.servers')),
             settingsButton(tr('settings.addMachine'), () => showServer({ username: 'root', port: 22 }), busy, true),
+            settingsButton(tr('settings.sshImport'), showSshImport, busy),
             settingsButton(tr('settings.openSshConfig'), async () => {
               try { await api('POST', '/dsh-remote/ssh-config', { action: 'open' }) } catch (error) { setErr(error.message) }
             }),
             settingsButton(tr(refreshing ? 'settings.refreshing' : 'settings.hostListRefresh'), refreshSettings, refreshing || busy)),
           refreshStatus ? h('p', { role: 'status', style: { color: T.ok, margin: '6px 0', fontSize: 12, overflowWrap: 'anywhere' } }, refreshStatus) : null,
-          listed.length ? listed.map(machine => {
+          machines.length ? machines.map(machine => {
             const key = machine.id || machine.host
             const result = rowState[key]
             const name = machine.name || machine.host
@@ -1342,10 +1338,10 @@ window.__ModuleLoader__.load({
               h('div', { style: { display: 'grid', minWidth: 0, gap: 2 } },
                 h('strong', { title: name, style: ellipsisStyle }, name),
                 h('span', { title: address, style: { ...ellipsisStyle, fontFamily: 'monospace' } }, address),
-                machine.id ? null : h('span', { style: { ...ellipsisStyle, fontSize: 11, color: T.muted } }, tr('settings.sshConfigSource'))),
+                machine.useSshConfig ? h('span', { style: { fontSize: 11, color: T.warn, overflowWrap: 'anywhere' } }, tr('settings.sshImportRequired')) : null),
               h('div', { style: { display: 'flex', gap: 8, whiteSpace: 'nowrap' } },
                 settingsButton(tr('settings.edit'), () => showServer(machine), busy),
-                settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), busy || result?.busy),
+                settingsButton(result?.busy ? tr('settings.testing') : tr('settings.testConn'), () => testServer(machine), busy || result?.busy || machine.useSshConfig),
                 machine.id ? settingsButton(tr('settings.delete'), () => removeServer(machine), busy || refreshing || result?.busy) : null),
               result?.text ? h('span', { role: 'status', style: { gridColumn: '1 / -1', overflowWrap: 'anywhere', color: result.failed ? T.danger : T.ok } }, result.text) : null)
           }) : h('p', null, tr('mapping.noServers'))),
@@ -1362,6 +1358,22 @@ window.__ModuleLoader__.load({
                 settingsButton(tr('settings.edit'), () => showMapping(mapping)),
                 settingsButton(tr('mapping.remove'), () => removeMapping(mapping), busy))))
           }) : h('p', null, tr('mapping.noServers'))),
+        sshImport ? h(SettingsEditor, {
+          title: tr('settings.sshImport'), close: closeSshImport,
+          footer: h(React.Fragment, null,
+            settingsButton(tr('file.cancel'), closeSshImport, busy),
+            settingsButton(tr(busy ? 'settings.saving' : 'settings.save'), saveSshImport, busy || !sshImport.alias, true)),
+        },
+          h('p', null, tr('settings.sshImportHint')),
+          sshImport.loading ? h('p', { role: 'status' }, tr('picker.loading'))
+            : sshImport.entries.length ? row(tr('settings.sshImportAlias'), h('select', {
+                value: sshImport.alias, disabled: busy, style: { ...inputS, minWidth: 0 },
+                onChange: e => { const alias = e.target.value; setSshImport(current => ({ ...current, alias, error: '' })) },
+              }, h('option', { value: '', disabled: true }, tr('picker.chooseMachine')),
+              ...sshImport.entries.map(entry => h('option', { key: entry.alias, value: entry.alias },
+                entry.alias + ' · ' + machineAddress({ host: entry.hostName, username: entry.user, port: entry.port })))), 'alias')
+              : !sshImport.error ? h('p', null, tr('settings.sshImportEmpty')) : null,
+          banner(sshImport.error)) : null,
         form ? h(SettingsEditor, {
           title: tr(form.id ? 'settings.editMachine' : 'settings.addMachine'), close: closeServer,
           footer: h(React.Fragment, null,
@@ -1371,24 +1383,7 @@ window.__ModuleLoader__.load({
         },
           h(React.Fragment, null,
           row(tr('settings.name'), React.createElement('input', { className: 'dsh-rw-input', value: form.name, onChange: setF('name'), placeholder: tr('settings.name') + ' (e.g. build-server)', style: inputS }), 'n'),
-          row(tr('settings.host'), React.createElement('input', { className: 'dsh-rw-input', value: form.host, onChange: setF('host'), placeholder: form.useSshConfig ? tr('settings.sshImport') + ' Host 别名' : 'IP or hostname', style: inputS }), 'h'),
-          row(tr('settings.useSshConfig'), React.createElement('input', { type: 'checkbox', checked: !!form.useSshConfig, onChange: setFb('useSshConfig') }), 'sshc'),
-          form.useSshConfig ? React.createElement('div', { style: { fontSize: 11, opacity: 0.8, marginBottom: 8, lineHeight: 1.5 } }, tr('settings.useSshConfigHint')) : null,
-          // Issue #50: a literal save also touches ~/.ssh/config (managed
-          // block) — say so where the choice is made.
-          !form.useSshConfig ? React.createElement('div', { style: { fontSize: 11, opacity: 0.8, marginBottom: 8, lineHeight: 1.5 } }, tr('settings.saveWritesSshConfig')) : null,
-          form.useSshConfig ? (() => {
-            // Preview where the alias points, from the same resolution the
-            // connect path uses (the host list carries it — issue #38).
-            const preview = machines.find((m) => m.host === form.host && m.useSshConfig)
-            const res = preview && preview.sshConfigResolved
-            if (!res) return null
-            return React.createElement('div', { style: { fontSize: 11, marginBottom: 8, color: res.matched ? T.ok : T.warn, lineHeight: 1.5 } },
-              res.matched
-                ? form.host + ' ' + tr('settings.sshResolvedTo', { user: res.username || '?', host: res.host, port: res.port })
-                : tr('settings.sshResolvedNone', { alias: form.host }),
-              (res.warnings && res.warnings.length) ? React.createElement('div', { style: { opacity: 0.85 } }, tr('settings.sshResolvedWarn', { msg: res.warnings.join(' ') })) : null)
-          })() : null,
+          row(tr('settings.host'), React.createElement('input', { className: 'dsh-rw-input', value: form.host, onChange: setF('host'), placeholder: 'IP or hostname', style: inputS }), 'h'),
           row(tr('settings.port'), React.createElement('input', { className: 'dsh-rw-input', value: form.port, onChange: setF('port'), placeholder: '22', style: { ...inputS, width: 70 } }), 'p'),
           row(tr('settings.user'), React.createElement('input', { className: 'dsh-rw-input', value: form.username, onChange: setF('username'), placeholder: 'root', style: inputS }), 'u'),
           // The password box is EMPTY by design (the host never echoes a secret
@@ -1424,19 +1419,11 @@ window.__ModuleLoader__.load({
             style: { ...buttonS, width: '100%', marginBottom: advOpen ? 10 : 0, color: advOpen ? T.primary : 'inherit', fontWeight: advOpen ? 600 : 400, borderStyle: 'dashed' },
           }, advOpen ? tr('settings.advCollapse') : tr('settings.advExpand')),
           advOpen ? React.createElement('div', { key: 'adv', style: { paddingTop: 2 } },
-            // Issue #51 — transport backend. Placed FIRST in the advanced block
-            // because it changes what the fields below even mean: with the
-            // system-OpenSSH backend, host/user/port/key all come from
-            // ~/.ssh/config and only the machine name (an alias) matters.
             row(tr('settings.backend'), React.createElement('select', { value: form.backend || 'native', onChange: setF('backend'), style: { ...inputS, maxWidth: 260 } },
               React.createElement('option', { value: 'native' }, tr('settings.backendNative')),
               React.createElement('option', { value: 'openssh' }, tr('settings.backendOpenssh'))), 'be'),
-            (form.backend === 'openssh')
-              ? React.createElement('div', { style: { fontSize: 11, opacity: 0.85, marginBottom: 8, marginLeft: LABEL_W + 8, lineHeight: 1.55 } },
-                  React.createElement('div', null, tr('settings.backendOpensshHint')),
-                  form.useSshConfig
-                    ? React.createElement('div', { style: { color: T.ok, marginTop: 2 } }, tr('settings.backendOpensshAliasOk'))
-                    : null)
+            form.backend === 'openssh'
+              ? h('div', { style: { fontSize: 11, opacity: 0.85, marginBottom: 8 } }, tr('settings.backendOpensshHint'))
               : null,
             (form.backend === 'openssh')
               ? row(tr('settings.sshBinary'), React.createElement('input', { value: form.sshBinary || '', onChange: setF('sshBinary'), placeholder: tr('settings.sshBinaryPlaceholder'), style: inputS }), 'sb')
@@ -1555,9 +1542,8 @@ window.__ModuleLoader__.load({
       const mappingBusy = !!setupPhase
       const mappingConfirm = useConfirm(true)
       const [tab, setTab] = React.useState('local')
-      const [machineList, setMachineList] = React.useState({ machines: [], sshHosts: [], loading: true, error: '' })
-      const { machines, sshHosts, loading: machinesLoading, error: machinesError } = machineList
-      const [importingMachine, setImportingMachine] = React.useState(false)
+      const [machineList, setMachineList] = React.useState({ machines: [], loading: true, error: '' })
+      const { machines, loading: machinesLoading, error: machinesError } = machineList
       const [machineId, setMachineId] = React.useState('')
       const [path, setPath] = React.useState('')
       const [err, setErr] = React.useState('')
@@ -1596,21 +1582,11 @@ window.__ModuleLoader__.load({
         return b.replace(/[\\/]+$/, '') + sep + n
       }
 
-      // Identity of the machine a listing was answered for (the /ls response
-      // echoes it), checked against the machine the fetch INTENDED. The picker
-      // memoizes "machine already active", but the settings page can switch
-      // machines too — validate every listing before trusting the memo. A
-      // machine may show up as its ~/.ssh/config alias OR its resolved host, so
-      // accept either identity; nothing to compare against → accept.
+      // Older hosts can omit the machine ID from directory listings.
       const echoMatches = (id, echo) => {
         if (echo?.id) return echo.id === id
-        if (!echo || !echo.host) return true // older host half without an echo
-        const m = (machines || []).find((x) => x && x.id === id)
-        if (!m) return true
-        const cands = [{ host: String(m.host || ''), port: Number(m.port) || 22, username: String(m.username || '') }]
-        const r = m.sshConfigResolved
-        if (r && r.host) cands.push({ host: String(r.host), port: Number(r.port) || 22, username: String(r.username || m.username || '') })
-        return cands.some((c) => c.host === String(echo.host) && c.port === (Number(echo.port) || 22) && c.username === String(echo.username || ''))
+        const machine = machines.find(item => item.id === id)
+        return !echo?.host || !machine || machineAddress(machine) === machineAddress(echo)
       }
 
       // Activate each machine once and serialize switches before browsing.
@@ -1676,30 +1652,26 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (!open) return
-        const session = { importing: false }
+        const session = {}
         pickerSessionRef.current = session
         // Bug fix: the picker must NOT reopen with the previous selection's
         // path — reset the path bar (and the browse state) on every open.
         setPath(''); setLevels(null); setWin(false)
         setErr(''); setLoading(false); setMachineId('')
-        setMachineList({ machines: [], sshHosts: [], loading: true, error: '' })
-        setImportingMachine(false)
+        setMachineList({ machines: [], loading: true, error: '' })
         setMapLocal(false); setMappedPath(''); setSetupPhase('')
         setLocalPop(null); setNewDirName(''); setMkdirPrompt(false); setPopOpen(false)
         postedCurrentRef.current = ''
-        Promise.allSettled([
-          api('GET', '/dsh-remote/machines'),
-          api('GET', '/dsh-remote/ssh-config'),
-        ]).then(([registry, sshConfig]) => {
+        api('GET', '/dsh-remote/machines').then(registry => {
           if (pickerSessionRef.current !== session) return
-          const saved = registry.value?.machines || []
-          const entries = sshConfig.value?.entries || []
-          const error = [registry, sshConfig].filter(result => result.status === 'rejected')
-            .map(result => String(result.reason?.message || result.reason)).join(' / ')
-          const selected = initialMachineId ? saved.find(m => m.id === initialMachineId)
-            : saved.find(m => m.id === registry.value?.currentId) || saved[0]
-          setMachineList({ machines: saved, sshHosts: entries, loading: false, error })
+          const saved = registry.machines || []
+          const available = saved.filter(machine => !machine.useSshConfig)
+          const selected = initialMachineId ? available.find(machine => machine.id === initialMachineId)
+            : available.find(machine => machine.id === registry.currentId) || available[0]
+          setMachineList({ machines: saved, loading: false, error: '' })
           setMachineId(selected?.id || '')
+        }).catch(error => {
+          if (pickerSessionRef.current === session) setMachineList({ machines: [], loading: false, error: error.message })
         })
         return () => {
           pickerSessionRef.current = null
@@ -1749,7 +1721,7 @@ window.__ModuleLoader__.load({
       }
 
       const switchTab = (t) => {
-        if (mappingBusy || pickerSessionRef.current?.importing) return
+        if (mappingBusy) return
         closeBrowser()
         setTab(t); setErr('')
         // each tab keeps its own path — never leak the other tab's selection
@@ -1816,33 +1788,6 @@ window.__ModuleLoader__.load({
         setMachineId(machine?.id || '')
         setLevels(null); setPath(''); setWin(false); setPopOpen(false); setErr('')
         setLoading(false)
-      }
-
-      const chooseMachine = async value => {
-        const session = pickerSessionRef.current
-        if (!session || session.importing) return
-        const saved = machines.find(machine => value === 'machine:' + machine.id)
-        if (saved) { selectMachine(saved); return }
-        const host = sshHosts.find(entry => value === 'ssh:' + entry.alias)
-        if (!host) return
-        session.importing = true
-        setImportingMachine(true)
-        selectMachine(null)
-        try {
-          // The SSH import activates its machine. Let any earlier switch land first.
-          await currentPromiseRef.current?.promise.catch(() => {})
-          if (pickerSessionRef.current !== session) return
-          const result = await api('POST', '/dsh-remote/machines', { action: 'from-ssh-config', alias: host.alias })
-          if (pickerSessionRef.current !== session) return
-          if (!result.machine?.id) throw new Error(tr('picker.importMachineFailed', { alias: host.alias }))
-          setMachineList(previous => ({ ...previous, machines: result.machines || [...previous.machines, result.machine] }))
-          selectMachine(result.machine)
-        } catch (error) {
-          if (pickerSessionRef.current === session) setErr(error.message)
-        } finally {
-          session.importing = false
-          if (pickerSessionRef.current === session) setImportingMachine(false)
-        }
       }
 
       const commitPath = async (p) => {
@@ -2037,9 +1982,8 @@ window.__ModuleLoader__.load({
       }, [open, busy, tab, path, machineId, popOpen, mkdirPrompt, mapLocal, mappedPath, mappingBusy, mappingConfirm.node])
 
       if (!open) return null
-      const configHosts = unsavedSshHosts(machines, sshHosts)
-      const machinePlaceholder = machinesLoading || importingMachine ? tr('picker.loading')
-        : !machines.length && !configHosts.length && !machinesError ? tr('picker.noMachines') : tr('picker.chooseMachine')
+      const machinePlaceholder = machinesLoading ? tr('picker.loading')
+        : !machines.length && !machinesError ? tr('picker.noMachines') : tr('picker.chooseMachine')
       const tabBtn = (t, lbl) => React.createElement('button', {
         type: 'button',
         className: 'dsh-rw-btn dsh-rw-tab' + (tab === t ? ' is-active' : ''),
@@ -2090,14 +2034,11 @@ window.__ModuleLoader__.load({
                 h('span', { style: { fontSize: 12, opacity: 0.8, whiteSpace: 'nowrap' } }, tr('picker.remoteMachine')),
                 h('select', { className: 'dsh-rw-input', 'aria-label': tr('picker.remoteMachine'),
                   style: { ...inputS, minWidth: 0, maxWidth: 320, textOverflow: 'ellipsis' },
-                  value: machineId ? 'machine:' + machineId : '', disabled: machinesLoading || importingMachine || busy || mappingBusy,
-                  onChange: e => chooseMachine(e.target.value),
+                  value: machineId ? 'machine:' + machineId : '', disabled: machinesLoading || busy || mappingBusy,
+                  onChange: e => selectMachine(machines.find(machine => 'machine:' + machine.id === e.target.value)),
                 }, h('option', { value: '', disabled: true }, machinePlaceholder),
-                ...machines.map(machine => h('option', { key: machine.id, value: 'machine:' + machine.id },
-                  `${machine.name || machine.host} (${machineAddress(machine)})`)),
-                configHosts.length ? h('optgroup', { label: tr('picker.sshConfigMachines') },
-                  ...configHosts.map(host => h('option', { key: host.alias, value: 'ssh:' + host.alias },
-                    `${host.alias} (${machineAddress({ username: host.user, host: host.hostName || host.alias, port: host.port })})`))) : null),
+                ...machines.map(machine => h('option', { key: machine.id, value: 'machine:' + machine.id, disabled: !!machine.useSshConfig },
+                  `${machine.name || machine.host} (${machineAddress(machine)})` + (machine.useSshConfig ? ' · ' + tr('settings.sshImportRequired') : '')))),
               ),
               machinesError ? h('div', { role: 'alert', style: { color: T.danger, fontSize: 12 } }, tr('picker.machineListFailed', { msg: machinesError })) : null,
               React.createElement('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },

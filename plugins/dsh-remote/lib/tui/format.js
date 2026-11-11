@@ -149,8 +149,6 @@ export function targetFromWorkspace(input) {
 
 /** hostname / IPv4 / IPv6（可带方括号）的宽松字符校验。 */
 const HOST_TOKEN_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._:-]+)$/
-/** ~/.ssh/config 的 Host alias（字母数字与 `._-`；允许 `*`/`?` 通配符）。 */
-const ALIAS_TOKEN_RE = /^[A-Za-z0-9._*?-]+$/
 /** 端口：1–5 位数字，范围另判。 */
 const PORT_RE = /^\d{1,5}$/
 
@@ -161,26 +159,20 @@ const PORT_RE = /^\d{1,5}$/
  *   入 `t` 让函数自己翻译成人类可读的错误串。
  * - `patch` 直接可作为 `api.upsertMachine()` 的参数（MachinePatch）；密码 /
  *   passphrase 为空时**不写进 patch**（“留空表示不修改”），从不回显。
- * - `useSshConfig === true` 时 `host` 是 `~/.ssh/config` 的 Host alias：仍必填，
- *   但按 alias 字符集校验（不要求是 hostname/IP）；用户名/端口可留空（连接时
- *   由 ssh 配置解析）。
  *
  * @param {object} form - 表单字段（name/host/port/username/auth/password/
- *   privateKeyPath/passphrase/group/useSshConfig/id）。
+ *   privateKeyPath/passphrase/group/id）。
  * @param {(key: string) => string} [t] - 可选的文案渲染器，省略时 errors 保留 key。
  * @returns {{ errors: string[], patch: object }}
  */
 export function validateMachineForm(form, t) {
   const tr = typeof t === 'function' ? t : (key) => key
   const input = form || {}
-  const useSshConfig = input.useSshConfig === true
   const errors = []
 
   const host = String(input.host === undefined || input.host === null ? '' : input.host).trim()
   if (!host) {
     errors.push(tr('form.errHostRequired'))
-  } else if (useSshConfig) {
-    if (!ALIAS_TOKEN_RE.test(host)) errors.push(tr('form.errAliasInvalid'))
   } else if (!HOST_TOKEN_RE.test(host)) {
     errors.push(tr('form.errHostInvalid'))
   }
@@ -213,7 +205,7 @@ export function validateMachineForm(form, t) {
     host,
     port,
     username: username || 'root',
-    useSshConfig,
+    useSshConfig: false,
     useAgent: resolvedAuth === 'agent',
     privateKeyPath,
     group,
@@ -259,7 +251,6 @@ export function formFromMachine(machine) {
     host: String(source.host || ''),
     port: String(Number(source.port) || 22),
     username: String(source.username || ''),
-    useSshConfig: source.useSshConfig === true,
     auth,
     password: '',
     privateKeyPath: String(source.privateKeyPath || ''),
@@ -283,7 +274,6 @@ export function emptyMachineForm() {
     host: '',
     port: '22',
     username: '',
-    useSshConfig: false,
     auth: 'password',
     password: '',
     privateKeyPath: '',

@@ -21,7 +21,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { execFile } from 'node:child_process'
 import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, statSync, realpathSync, renameSync, copyFileSync, appendFileSync, rmSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import iconv from 'iconv-lite'
@@ -33,7 +33,8 @@ import {
 import { createHostKeyGuard, isHostKeyKnown as _isHostKeyKnown } from './hostkey.js'
 import { compileIgnore, ignorePatternsFor, DEFAULT_IGNORE } from './ignore.js'
 import { friendlyMessage } from './errors.js'
-import { listAliases, sshConfigPath, readSshConfigText, resolveMachineSshConfig, resolveLiteralSshConfig, readRawSshConfig, upsertManagedHostBlock, removeManagedHostBlock, writeSshConfig } from './sshconfig.js'
+import { listAliases, sshConfigPath, readSshConfigText, sshAliasTarget, resolveLiteralSshConfig, resolveMachineSshConfig } from './sshconfig.js'
+import { ensurePrivateSshConfig } from './private-ssh-config.cjs'
 import { createRemoteFileReference, installFileReferenceOverlay, DEFAULT_EXCLUDED_DIRECTORIES } from './file-reference.js'
 import { getSecret, deleteSecret, platformBackend, persistPassword } from './credential.js'
 import { syncTree, pushTree, loadSyncState, saveSyncState } from './sync.js'
@@ -53,8 +54,7 @@ import { formatAuditLine, readAuditLines } from './audit.js'
 import { loadMachines as _loadMachines, saveMachines as _saveMachines, sanitizeMachine as _sanitizeMachine, applyMachine as _applyMachine, machineId as _machineId, normalizeMachineGroup, filterMachinesByGroup, resolveProbeCredentials } from './registry.js'
 import { registerHttpTransports } from './http-transport.js'
 import { createHostApi } from './host-api.js'
-import { SshPool, ActivePool, createPool } from './pool.js'
-import { isSystemOpenSshBackend, sshBinaryAvailable, resolveSshBinary } from './openssh.js'
+import { ActivePool, createPool } from './pool.js'
 import { createFsRoutes } from './routes-fs.js'
 import { listDirStructured, removeRemoteTree } from './remote-fs.js'
 import { installWorkspaceToolRouting } from './workspace-tools.js'
@@ -156,7 +156,7 @@ export const Config = z.object({
    *  ssh-agent / keyboard-interactive;
    *  `openssh` delegates to the LOCAL `ssh` executable, which is the only way to
    *  reach hosts that allow GSSAPI/Kerberos (kinit) or that rely on other
-   *  OpenSSH-only `~/.ssh/config` features (ProxyCommand, PKCS11Provider,
+   *  OpenSSH-only features configured in DSH's private ssh_config (ProxyCommand, PKCS11Provider,
    *  ControlMaster, Match blocks). See lib/openssh.js for the trade-offs. */
   backend: z.string().default('native'),
   /** The `ssh` executable the `openssh` backend drives (PATH name or a full
@@ -407,6 +407,8 @@ const machineId = _machineId
 // ── host-key registry (TOFU) ──────────────────────────────────────────────
 const KNOWN_HOSTS_FILE = 'known_hosts.json'
 const knownHostsFile = () => path.join(remoteWorkspacesRoot(), KNOWN_HOSTS_FILE)
+const sshConfigFile = () => ensurePrivateSshConfig(remoteWorkspacesRoot())
+const poolOptions = { knownHostsFile, sshConfigFile }
 const isHostKeyKnown = (host, port) => _isHostKeyKnown(knownHostsFile(), host, port)
 
 // ── encoding helpers ───────────────────────────────────────────────────────
@@ -425,7 +427,7 @@ function encodeText(s, enc) {
 export async function apply(ctx, config) {
   // The ACTIVE pool: a delegating facade, because `backend` is per machine and
   // the plugin must keep ONE long-lived object to hang its hooks on (issue #51).
-  const pool = new ActivePool(config, { knownHostsFile })
+  const pool = new ActivePool(config, poolOptions)
   ctx.effect(() => () => pool.close(), 'dsh-remote.close')
 
   migrateLegacyData()
@@ -435,142 +437,14 @@ export async function apply(ctx, config) {
   const machines = store.list
   const machineIndex = (id) => machines.findIndex((m) => m.id === id)
 
-  // ── ssh-config aliases (issue #38) ────────────────────────────────────────
-  //
-  // A machine may be saved as an ALIAS (`useSshConfig: true`, `host` = the Host
-  // line of ~/.ssh/config). The registry then holds NO HostName/user/port/key —
-  // every connect resolves the alias against the config file as it is right now
-  // (VSCode Remote-SSH behaviour). The text is memoised for a couple of seconds
-  // so one request that resolves several machines reads the file once, while an
-  // edit to ~/.ssh/config still lands almost immediately.
-  let sshConfigCache = { text: '', at: 0 }
-  const sshConfigText = (fresh = false) => {
-    const now = Date.now()
-    if (fresh || now - sshConfigCache.at > 2000) sshConfigCache = { text: readSshConfigText(), at: now }
-    return sshConfigCache.text
-  }
+  const aliasOf = machine => machine?.importedSshAlias || (machine?.useSshConfig ? machine.host : '')
 
-  /**
-   * A machine's CONNECT identity: alias machines are resolved through
-   * ~/.ssh/config; every other machine is returned untouched. The returned
-   * record keeps the registry fields (id, password, credentialBackend, …) so
-   * keychain lookups and the settings UI keep working.
-   */
-  const loggedSshWarnings = new Map()
-  const warnSshOnce = (alias, warnings) => {
-    // Warn once per distinct warning set: withSshConfig runs on every tool
-    // call, and an unmatched alias would otherwise fill the log with the same
-    // line.
-    const signature = warnings.join(' | ')
-    if (signature && loggedSshWarnings.get(alias) !== signature) {
-      loggedSshWarnings.set(alias, signature)
-      try {
-        const logger = typeof ctx.get === 'function' ? ctx.get('logger') : undefined
-        if (logger && typeof logger.warn === 'function') {
-          logger.warn(`[dsh-remote] ssh-config alias "${alias}": ${warnings.join(' ')}`)
-        }
-      } catch { /* logging is best-effort */ }
-    }
-  }
-  const withSshConfig = (m) => {
-    if (!m) return m
-    // Issue #50: ~/.ssh/config wins for ANY host it names, not only alias
-    // machines. A literal machine's stored host/user/port/key is a COPY that
-    // goes stale the moment the file is edited; when a Host block names the
-    // machine's host (a bare `Host *` does not name it), the file's values
-    // take over and the record fills the gaps.
-    if (!m.useSshConfig) {
-      const lit = resolveLiteralSshConfig(m, { text: sshConfigText() })
-      if (!lit) return m
-      warnSshOnce(lit.alias, lit.warnings)
-      return {
-        ...m,
-        sshConfigMatched: true,
-        sshConfigWarnings: lit.warnings,
-        // The name the user typed, kept for the system-OpenSSH backend: ssh
-        // must match its Host blocks against exactly this (connectTargetFor).
-        sshConfigName: m.host,
-        host: lit.host || m.host,
-        port: lit.port || m.port,
-        username: lit.username || m.username,
-        privateKeyPath: lit.privateKeyPath || m.privateKeyPath,
-        agentSocket: lit.agentSocket || '',
-        identitiesOnly: !!lit.identitiesOnly,
-        proxy: lit.proxy || m.proxy,
-      }
-    }
-    const resolved = resolveMachineSshConfig(m, { text: sshConfigText() })
-    if (!resolved) return m
-    warnSshOnce(resolved.alias, resolved.warnings)
-    return {
-      ...m,
-      sshAlias: resolved.alias,
-      sshConfigMatched: resolved.matched,
-      sshConfigWarnings: resolved.warnings,
-      host: resolved.host,
-      port: resolved.port,
-      username: resolved.username || m.username,
-      privateKeyPath: resolved.privateKeyPath || '',
-      agentSocket: resolved.agentSocket || '',
-      identitiesOnly: !!resolved.identitiesOnly,
-      proxy: resolved.proxy,
+  const requireIndependentMachine = machine => {
+    if (machine?.useSshConfig) {
+      throw codedError('SSH_IMPORT_REQUIRED', '请在「远程工作区」设置中导入旧 SSH 别名，或填写实际连接参数。', { httpStatus: 409 })
     }
   }
 
-  /**
-   * The CONNECT target for a pool, given a machine's RESOLVED connect identity
-   * (i.e. a record that already passed through withSshConfig()).
-   *
-   * Issue #38 resolves an alias machine into concrete host/user/port/key values
-   * because the native backend has to dial them itself. Issue #51's
-   * system-OpenSSH backend must NOT do that: it hands the name to `ssh`, and ssh
-   * matches its `Host` blocks against exactly the name it was given. Passing the
-   * resolved HostName instead would stop `Host myalias` blocks from matching and
-   * silently drop the very settings (GSSAPIAuthentication=yes, ProxyCommand,
-   * PKCS11Provider, Match blocks) that make this backend worth choosing. For an
-   * alias machine on that backend the ALIAS is therefore the connect target, no
-   * -l/-p/-i of our own is emitted, and ~/.ssh/config stays the single source of
-   * truth for that machine (which is also exactly what issue #50 asks for).
-   *
-   * @param {object} eff - a record after withSshConfig() (`sshAlias` present for
-   *   alias machines).
-   * @returns {{host: string, port: number, username: string, privateKeyPath: string, proxy: object|undefined, aliasNative: boolean}}
-   */
-  const connectTargetFor = (eff) => {
-    // Issue #50: a LITERAL machine whose host a Host block names is in the same
-    // position as an alias machine on the OpenSSH backend — ssh must match its
-    // blocks against the ORIGINAL name, so it is handed over verbatim too.
-    const aliasNative = !!(eff && isSystemOpenSshBackend(eff) && (eff.useSshConfig || eff.sshConfigMatched))
-    if (!aliasNative) {
-      return {
-        host: String((eff && eff.host) || ''),
-        port: Number((eff && eff.port) || 0) || 22,
-        username: String((eff && eff.username) || ''),
-        privateKeyPath: String((eff && eff.privateKeyPath) || ''),
-        proxy: eff && eff.proxy,
-        aliasNative: false,
-      }
-    }
-    const alias = String((eff && (eff.sshAlias || eff.sshConfigName || eff.host)) || '')
-    return {
-      // The alias itself; ssh expands HostName/User/Port/IdentityFile and every
-      // other directive while matching that Host block.
-      host: alias,
-      port: 0,            // 0 → no -p is emitted, so Port comes from the config
-      username: '',       // '' → no -l is emitted, so User comes from the config
-      privateKeyPath: '', // '' → no -i is emitted, so IdentityFile comes from it
-      proxy: undefined,   // a ProxyJump written in the config is honoured by ssh
-      aliasNative: true,
-    }
-  }
-
-  /** The alias a machine was saved as ('' for a machine with literal values). */
-  const aliasOf = (m) => (m && m.sshAlias) || (m && m.useSshConfig ? String(m.host || '') : '')
-
-  /** Machines as the settings UI sees them: secrets stripped, plus the
-   *  ~/.ssh/config resolution of an alias machine (issue #38) — and, since
-   *  issue #50, of a LITERAL machine whose host a Host block names, so the row
-   *  can show that the file now drives it. */
   /**
    * Does this machine have a LIVE connection right now?
    *
@@ -593,9 +467,6 @@ export async function apply(ctx, config) {
 
   const machinesForClient = () => machines.map((m) => ({
     ...sanitizeMachine(m),
-    sshConfigResolved: m.useSshConfig
-      ? resolveMachineSshConfig(m, { text: sshConfigText() })
-      : resolveLiteralSshConfig(m, { text: sshConfigText() }),
     // Live socket, not a historical latency (see isMachineLive).
     connected: isMachineLive(m),
   }))
@@ -604,12 +475,12 @@ export async function apply(ctx, config) {
    * (rw_connect save:false) wins, then the stored current, then config default. */
   let ephemeral = null
   const activeMachine = () => {
-    if (ephemeral) return withSshConfig(ephemeral)
+    if (ephemeral) return ephemeral
     if (store.currentId) {
       const i = machineIndex(store.currentId)
-      if (i >= 0) return withSshConfig(machines[i])
+      if (i >= 0) return machines[i]
     }
-    if (config.host) return withSshConfig({ id: machineId(), name: config.host, host: config.host, port: config.port, username: config.username, password: config.password, privateKeyPath: config.privateKeyPath, passphrase: config.passphrase })
+    if (config.host) return { ...config, id: machineId(), name: config.host }
     return null
   }
   const currentMachine = activeMachine
@@ -665,6 +536,7 @@ export async function apply(ctx, config) {
   const applyActiveMachine = async () => {
     const m = activeMachine()
     if (!m || !m.host) return
+    requireIndependentMachine(m)
     const pw = await machinePassword(m)
     // Snapshot the diff baseline BEFORE applyMachine mutates the shared config
     // IN PLACE: pool.config IS this config object, so setTarget would otherwise
@@ -672,17 +544,6 @@ export async function apply(ctx, config) {
     // OLD connection alive across a machine switch (issue #25 hazard).
     const previous = targetFields(config)
     applyMachine(config, { ...m, password: pw || m.password || '' })
-    // Issue #51: an ssh-config alias on the system-OpenSSH backend connects AS
-    // the alias, so ssh — not the plugin — expands HostName/User/Port/
-    // IdentityFile/ProxyJump, and the `Host` block keeps matching.
-    const t = connectTargetFor(m)
-    if (t.aliasNative) {
-      config.host = t.host
-      config.port = 22
-      config.username = ''
-      config.privateKeyPath = ''
-      config.proxy = undefined
-    }
     pool.setTarget(targetFields(config), previous)
     lastAppliedMachine = appliedFingerprint()
   }
@@ -732,15 +593,8 @@ export async function apply(ctx, config) {
    *  is still a legitimate credential source for a pool the same process later
    *  resolves for that identity: without it a mirror picked on a temporary
    *  connection would resolve to an empty-credential pool and fail to connect.
-   *
-   *  An ssh-config ALIAS machine (issue #38) is matched through its RESOLVED
-   *  identity, and directly by the alias the mirror recorded — so a mirror keeps
-   *  resolving to its machine even after a HostName/port change in ~/.ssh/config,
-   *  which is the whole point of not copying those values into the registry. */
-  const identityOf = (m) => {
-    const r = withSshConfig(m)
-    return { host: r.host, port: Number(r.port) || 22, username: r.username || '' }
-  }
+   *  Old workspace records may also refer to the machine's imported alias. */
+  const identityOf = m => ({ host: m.host, port: Number(m.port) || 22, username: m.username || '' })
   const identityMatches = (m, { host, port, username }) => {
     if (!m) return false
     const id = identityOf(m)
@@ -766,19 +620,17 @@ export async function apply(ctx, config) {
     const rec = target.pinned && target.machineId
       ? machines[machineIndex(target.machineId)]
       : machineRecordFor(target)
+    requireIndependentMachine(rec)
     if (target.pinned && ((target.machineId && !rec) || (rec && !identityMatches(rec, target)))) {
       const message = rec
         ? 'The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.'
         : 'The saved SSH server for this workspace is unavailable. Open a new remote workspace to connect again.'
       throw codedError('REMOTE_BINDING_CHANGED', message, { httpStatus: 409 })
     }
-    const eff = rec ? withSshConfig(rec) : null
-    // Issue #51: on the system-OpenSSH backend an alias machine connects AS its
-    // alias so ~/.ssh/config (not the registry) supplies host/user/port/key.
-    const t = connectTargetFor(eff || target)
-    const host = t.aliasNative ? t.host : ((eff && eff.host) || target.host)
-    const port = t.aliasNative && !target.pinned ? 0 : (Number((eff && eff.port) || target.port) || 22)
-    const username = t.aliasNative && !target.pinned ? '' : ((eff && eff.username) || target.username || 'root')
+    const eff = rec
+    const host = eff?.host || target.host
+    const port = Number(eff?.port || target.port) || 22
+    const username = eff?.username || target.username || 'root'
     const pinnedHost = target.pinned ? target.host : ''
     const existing = machinePools.get(key)
     if (existing) {
@@ -792,13 +644,13 @@ export async function apply(ctx, config) {
       if (eff) {
         existing.config.pinnedHost = pinnedHost
         existing.config.password = eff.password || ''
-        existing.config.privateKeyPath = t.aliasNative ? '' : (eff.privateKeyPath || '')
+        existing.config.privateKeyPath = eff.privateKeyPath || ''
         existing.config.passphrase = eff.passphrase || ''
         existing.config.useAgent = !!eff.useAgent
-        existing.config.agentSocket = t.aliasNative ? '' : (eff.agentSocket || '')
+        existing.config.agentSocket = eff.agentSocket || ''
         existing.config.identitiesOnly = !!eff.identitiesOnly
         existing.config.keyboardInteractive = !!eff.keyboardInteractive
-        existing.config.proxy = t.aliasNative ? undefined : (eff.proxy || undefined)
+        existing.config.proxy = eff.proxy || undefined
         existing.config.hostKeyMode = eff.hostKeyMode || config.hostKeyMode
         existing.config.backend = eff.backend || config.backend
         existing.config.sshBinary = (typeof eff.sshBinary === 'string') ? eff.sshBinary : config.sshBinary
@@ -817,13 +669,13 @@ export async function apply(ctx, config) {
       username,
       pinnedHost,
       password: (eff && eff.password) || '',
-      privateKeyPath: t.aliasNative ? '' : ((eff && eff.privateKeyPath) || ''),
+      privateKeyPath: eff?.privateKeyPath || '',
       passphrase: (eff && eff.passphrase) || '',
       useAgent: eff ? !!eff.useAgent : !!config.useAgent,
-      agentSocket: t.aliasNative ? '' : ((eff && eff.agentSocket) || ''),
+      agentSocket: eff?.agentSocket || '',
       identitiesOnly: !!(eff && eff.identitiesOnly),
       keyboardInteractive: eff ? !!eff.keyboardInteractive : !!config.keyboardInteractive,
-      proxy: t.aliasNative ? undefined : ((eff && eff.proxy) || undefined),
+      proxy: eff?.proxy || undefined,
       hostKeyMode: (eff && eff.hostKeyMode) || config.hostKeyMode,
       // Issue #51: the transport backend is a per-machine choice — an
       // enterprise Kerberos host needs `openssh` while its neighbours stay on
@@ -834,7 +686,7 @@ export async function apply(ctx, config) {
       // session passes its own mirror-resolved remote path explicitly.
       workspace: '',
     })
-    const created = new ActivePool(poolConfig, { knownHostsFile })
+    const created = new ActivePool(poolConfig, poolOptions)
     // Keychain-backed passwords resolve against THIS pool's machine record.
     created.passwordResolver = async () => machinePassword(eff || { id: '', password: poolConfig.password })
     machinePools.set(key, created)
@@ -853,6 +705,7 @@ export async function apply(ctx, config) {
     }
     const i = machineIndex(id)
     if (i < 0) return false
+    requireIndependentMachine(machines[i])
     // Idempotent: same machine, no ephemeral override, already applied → keep
     // the registry file, the credentials cache and the live pool untouched.
     // (The fingerprint is maintained by applyActiveMachine itself.)
@@ -1748,9 +1601,9 @@ export async function apply(ctx, config) {
     defineTool({
       name: 'rw_connect',
       description:
-        'Connect SSH to a remote host for remote workspace work. Two ways (issue #48): (1) pass machineId to connect with a machine ALREADY SAVED in the registry (list them with rw_machines) — every stored setting applies: password/keychain password, privateKeyPath + passphrase, useAgent, keyboardInteractive, proxy, hostKeyMode, backend, and ~/.ssh/config aliases; or (2) pass host plus any of username/port/password/privateKeyPath/passphrase/useAgent/keyboardInteractive/hostKeyMode/backend/name. Defaults to saving the machine to the registry (save=false keeps it as a temporary connection). Once connected, call rw_pick_workspace to pick the workspace directory this session should work in. With useSshConfig=true, `host` is an ALIAS from ~/.ssh/config and every value (HostName/user/port/IdentityFile/ProxyJump) is read from that file at connect time. For a host that only accepts GSSAPI/Kerberos (issue #51), pass backend="openssh" (with useSshConfig=true) so the local ssh — which holds your kinit ticket — performs the login. A failed connection is reported as an error message — it never takes the plugin down. An address change requires opening a new remote workspace.',
+        'Connect to a saved SSH machine by machineId, or supply a host and connection parameters. Connections are saved to the DSH registry by default. Use save=false for a temporary connection. Import legacy SSH aliases in Settings.',
       parameters: {
-        host: { type: 'string', description: 'Remote host IP or hostname (or a ~/.ssh/config alias with useSshConfig=true). Required unless machineId is given.' },
+        host: { type: 'string', description: 'Remote host IP or hostname. Required unless machineId is given.' },
         machineId: { type: 'string', description: 'Connect with a saved machine from the registry (see rw_machines): all its stored settings apply and it becomes the current machine. host/other fields are not needed — Supply host, username, or port to update the saved record for new workspaces.' },
         username: { type: 'string', description: 'SSH user (default from config or root)' },
         port: { type: 'integer', description: 'SSH port (default 22)' },
@@ -1760,14 +1613,15 @@ export async function apply(ctx, config) {
         useAgent: { type: 'boolean', description: 'Authenticate via the local SSH agent (SSH_AUTH_SOCK) instead of password/key' },
         keyboardInteractive: { type: 'boolean', description: 'Enable keyboard-interactive auth (OTP/动态码 prompts answered with the configured password)' },
         hostKeyMode: { type: 'string', description: 'Host-key policy for this machine: ask | strict | off (default from config)' },
-        backend: { type: 'string', description: 'SSH transport backend (issue #51): "native" (default) uses the built-in ssh2 client (password / private key / agent / keyboard-interactive); "openssh" drives the LOCAL ssh command, which is the only way to reach hosts that require GSSAPI/Kerberos (log in once with kinit) and which honours the whole of ~/.ssh/config (ProxyCommand, PKCS11Provider, Match blocks). Prefer "openssh" together with useSshConfig=true so the alias and its settings stay the single source of truth.' },
+        backend: { type: 'string', description: 'Use native (ssh2) or openssh (local ssh with the DSH configuration file).' },
         sshBinary: { type: 'string', description: 'Path (or PATH name) of the ssh executable the "openssh" backend drives — default "ssh"' },
         name: { type: 'string', description: 'Display name for a newly saved machine (default: the host)' },
-        useSshConfig: { type: 'boolean', description: 'Treat `host` as a ~/.ssh/config Host alias; resolve host/user/port/key/proxy from that file (issue #38)' },
+        useSshConfig: { type: 'boolean', description: 'Legacy option. Import SSH aliases explicitly in Settings.' },
         save: { type: 'boolean', description: 'Save this machine to the registry and make it current (default true)' },
       },
       output: textOut,
       async execute(args) {
+        requireIndependentMachine(args)
         const mid = String(args.machineId || '').trim()
         if (mid) {
           // Connect with an ALREADY SAVED machine (issue #48): the registry
@@ -1775,6 +1629,7 @@ export async function apply(ctx, config) {
           // keychain-backed passwords, stored passphrases, proxies, aliases.
           const i = machineIndex(mid)
           if (i < 0) throw new Error(`rw_connect: no saved machine "${mid}" — list saved machines with rw_machines`)
+          requireIndependentMachine(machines[i])
           const overrides = {}
           if (args.host !== undefined && String(args.host).trim()) overrides.host = String(args.host).trim()
           if (args.username !== undefined && String(args.username).trim()) overrides.username = String(args.username).trim()
@@ -1790,7 +1645,6 @@ export async function apply(ctx, config) {
         } else {
           const host = String(args.host || '').trim()
           if (!host) throw new Error('rw_connect: host is required — or pass machineId to connect with a saved machine (list them with rw_machines)')
-          const useSshConfig = !!args.useSshConfig
           const user = args.username || config.username || 'root'
           const port = Number(args.port) || undefined
           const rec = {
@@ -1811,27 +1665,15 @@ export async function apply(ctx, config) {
           { const g = normalizeMachineGroup(args); for (const k of Object.keys(g)) rec[k] = g[k] }
           if (args.hostKeyMode) rec.hostKeyMode = String(args.hostKeyMode)
           if (args.name) rec.name = String(args.name)
-          // Issue #51: pick the transport backend. `openssh` is what reaches
-          // GSSAPI/Kerberos-only hosts, and with useSshConfig=true the alias is
-          // handed to ssh verbatim so ~/.ssh/config stays the single source.
           if (args.backend) rec.backend = args.backend === 'openssh' ? 'openssh' : 'native'
           if (args.sshBinary !== undefined) rec.sshBinary = String(args.sshBinary)
-          // Issue #54: the per-machine `dsh web` command is settable by hand too,
-          // not only by the deploy flow (the README told users to set it and the
-          // settings UI offered nowhere to type it).
-          if (useSshConfig) rec.useSshConfig = true
-          // An alias connection must dial the RESOLVED identity (~/.ssh/config),
-          // while the registry keeps the alias itself — EXCEPT on the
-          // system-OpenSSH backend, where ssh resolves the alias itself.
-          const eff = useSshConfig ? withSshConfig(rec) : rec
-          const ct = connectTargetFor(eff)
           if (args.save !== false) {
             // Upsert into the registry and make it the current machine so the
             // settings UI and the tools always agree on who is active.
             const i = machines.findIndex((m) => m.host === rec.host && m.username === rec.username && Number(m.port) === rec.port)
             if (i >= 0) {
               machines[i] = {
-                ...machines[i], ...rec, useSshConfig, id: machines[i].id,
+                ...machines[i], ...rec, useSshConfig: false, id: machines[i].id,
                 // Secrets not re-supplied keep their stored values.
                 password: rec.password || machines[i].password || '',
                 passphrase: rec.passphrase !== undefined ? rec.passphrase : (machines[i].passphrase || ''),
@@ -1856,22 +1698,7 @@ export async function apply(ctx, config) {
             // identical target (setTarget alone would reuse a possibly half-open
             // cached client — same reconnect-probe reasoning as /connect).
             pool.invalidate()
-            pool.setTarget({
-              // connectTargetFor: on the system-OpenSSH backend an alias machine
-              // dials the alias, not the values it expands to.
-              host: ct.host, port: ct.aliasNative ? 22 : (Number(eff.port) || port || 22), username: ct.aliasNative ? '' : (eff.username || user),
-              password: rec.password, privateKeyPath: ct.privateKeyPath,
-              // Explicit (non-undefined) values so a stale passphrase/agent flag
-              // from a previous target cannot leak into this connection.
-              passphrase: eff.passphrase || '',
-              useAgent: !!rec.useAgent,
-              keyboardInteractive: !!rec.keyboardInteractive,
-              hostKeyMode: rec.hostKeyMode || config.hostKeyMode,
-              proxy: ct.proxy,
-              backend: rec.backend || config.backend,
-              sshBinary: rec.sshBinary !== undefined ? rec.sshBinary : config.sshBinary,
-              workspace: config.workspace,
-            })
+            await applyActiveMachine()
           }
         }
         // Shared probe tail: after either path the shared config holds the
@@ -1886,11 +1713,7 @@ export async function apply(ctx, config) {
             return { text: 'connect failed: ' + (res.stderr || 'exit ' + res.code) }
           }
           audit('connect', `connect ${effUser}@${effHost}:${effPort}`, 0)
-          const active = activeMachine()
-          const via = active && active.sshAlias
-            ? `\n(ssh-config alias "${active.sshAlias}" → ${effUser}@${effHost}:${effPort}` + (active.sshConfigWarnings && active.sshConfigWarnings.length ? `; ${active.sshConfigWarnings.join(' ')}` : '') + ')'
-            : ''
-          return { text: `Connected to ${effHost} as ${effUser}.${via}\n\npick a workspace with rw_pick_workspace (path=<abs>).` }
+          return { text: `Connected to ${effHost} as ${effUser}.\n\npick a workspace with rw_pick_workspace (path=<abs>).` }
         } catch (err) {
           throw new Error(friendlyMessage(err, { host: effHost, port: effPort }))
         }
@@ -1900,7 +1723,7 @@ export async function apply(ctx, config) {
     defineTool({
       name: 'rw_machines',
       description:
-        'List the machines saved in the registry, secrets stripped: id, name, host/port/username, auth method flags, ssh-config alias resolution, workspace, grouping labels (environment / tags / location), and which one is current. Optional filters (environment / tags / location / query) narrow the list - useful once you have many machines. Pass rw_connect(machineId=<id>) to connect with the full stored settings of a machine (issue #48).',
+        'List the machines saved in the registry, secrets stripped: id, name, host/port/username, auth method flags, workspace, grouping labels (environment / tags / location), and which one is current. Optional filters (environment / tags / location / query) narrow the list - useful once you have many machines. Pass rw_connect(machineId=<id>) to connect with the full stored settings of a machine (issue #48).',
       parameters: {
         environment: { type: 'string', description: 'Only machines in this environment (e.g. prod, staging)' },
         location: { type: 'string', description: 'Only machines in this location (e.g. shanghai, gpu-lab)' },
@@ -1930,16 +1753,8 @@ export async function apply(ctx, config) {
           if (m.privateKeyPath) auth.push(`key:${m.privateKeyPath}${m.passphrase ? ' (passphrase set)' : ''}`)
           if (m.useAgent) auth.push('agent')
           if (m.keyboardInteractive) auth.push('keyboard-interactive')
-          // Issue #51: say which transport will be used — on `openssh` the
-          // credentials may come entirely from ~/.ssh/config (GSSAPI/kinit), so
-          // "auth: NONE" would be actively misleading there.
-          const backend = m.backend === 'openssh' ? 'openssh' : 'native'
-          if (backend === 'openssh') auth.push('openssh backend (~/.ssh/config: GSSAPI/key/agent)')
-          let via = ''
-          if (m.useSshConfig) {
-            const eff = withSshConfig(m)
-            via = `  alias→${eff.username || ''}@${eff.host}:${Number(eff.port) || 22}`
-          }
+          if (m.backend === 'openssh') auth.push('openssh backend (DSH ssh_config)')
+          const via = m.useSshConfig ? '  [IMPORT REQUIRED]' : ''
           const ws = m.workspace ? `  workspace=${m.workspace}` : ''
           // Grouping labels, shown inline so a wrong-host pick is visible.
           const meta = []
@@ -3157,6 +2972,7 @@ export async function apply(ctx, config) {
    *  `ok`; throws HOST_REQUIRED (httpStatus 400) for a missing host, which the
    *  route maps back to its historical 400 response. */
   const upsertMachineRecord = async (body) => {
+    requireIndependentMachine(body)
     let warning = ''
     let warningDetail = ''
     const host = String(body.host || '').trim()
@@ -3170,10 +2986,9 @@ export async function apply(ctx, config) {
       id,
       name: String(body.name || '').trim() || host,
       host,
-      // Issue #38: an ALIAS machine stores only the Host line of
-      // ~/.ssh/config — HostName/user/port/key are resolved live at
-      // every connect instead of being copied into the registry.
-      useSshConfig: !!body.useSshConfig,
+      importedSshAlias: aliasOf(prev),
+      agentSocket: prev?.agentSocket || '',
+      identitiesOnly: !!prev?.identitiesOnly,
       port: Number(body.port) || 22,
       username: String(body.username || '').trim() || 'root',
       password: '',
@@ -3220,6 +3035,8 @@ export async function apply(ctx, config) {
             username: String(body.proxy.username || '').trim(),
             password: String(body.proxy.password || (prev && prev.proxy && prev.proxy.password) || ''),
             privateKeyPath: String(body.proxy.privateKeyPath || '').trim(),
+            agentSocket: prev?.proxy?.host === body.proxy.host ? prev.proxy.agentSocket : '',
+            identitiesOnly: prev?.proxy?.host === body.proxy.host && !!prev.proxy.identitiesOnly,
           } : undefined),
       credentialBackend: credBackend,
       recentWorkspaces: prev && prev.recentWorkspaces ? prev.recentWorkspaces : [],
@@ -3278,49 +3095,49 @@ export async function apply(ctx, config) {
     // alone, so a fresh registry stays "no choice yet" (not an
     // explicit none) and a previously-cleared registry stays cleared.
     saveMachines(machines, store.currentId, false)
-    // Issue #50: host/user/port/key have ONE home — ~/.ssh/config.
-    // Saving a literal machine upserts a marker-tagged Host block,
-    // so the file and the registry can never drift; the record's
-    // copy remains only as a fallback for a missing/renamed block.
-    // A Host block the USER wrote for the same name is never
-    // touched — the conflict is reported instead. Failures here are
-    // best-effort: the registry copy is already saved.
-    let sshConfigWarning = ''
-    if (!rec.useSshConfig) {
-      try {
-        const raw = readRawSshConfig(sshConfigPath())
-        let next = upsertManagedHostBlock(raw, {
-          alias: rec.host,
-          hostName: rec.host,
-          user: rec.username,
-          port: rec.port,
-          identityFile: rec.privateKeyPath,
-        })
-        // A RENAMED machine leaves the old managed block behind, and
-        // that block is the plugin's own artifact of the edit —
-        // retire it. (Deleting a machine removes nothing: the Host
-        // block is the user's ssh access, not plugin state.)
-        if (prev && prev.host && prev.host !== rec.host && !prev.useSshConfig) {
-          const rm = removeManagedHostBlock(next.text, prev.host)
-          next = { status: rm.status === 'removed' && next.status === 'unchanged' ? 'updated' : next.status, text: rm.text }
-        }
-        if (next.status === 'conflict') {
-          sshConfigWarning = `~/.ssh/config already names "${rec.host}" in a Host block that is not managed by dsh-remote — it was left untouched, and it now wins over the saved copy.`
-        } else if (next.status === 'appended' || next.status === 'updated') {
-          writeSshConfig(next.text, sshConfigPath())
-          sshConfigCache = { text: '', at: 0 }
-        }
-      } catch (sshErr) {
-        sshConfigWarning = `could not update ~/.ssh/config (${String((sshErr && sshErr.message) || sshErr)}); the registry copy was saved.`
-      }
-    }
     return {
       machine: sanitizeMachine(rec),
       machines: machinesForClient(),
       currentId: store.currentId,
       ...(warning ? { warning, warningDetail } : {}),
-      ...(sshConfigWarning ? { sshConfigWarning } : {}),
     }
+  }
+
+  const importSshMachine = alias => {
+    const text = readSshConfigText()
+    const entry = listAliases(text).find(item => item.alias === alias)
+    if (!entry) throw codedError('SSH_ALIAS_NOT_FOUND', 'SSH alias not found: ' + alias, { httpStatus: 404 })
+
+    const matching = machines.filter(machine => (aliasOf(machine) || machine.host) === alias)
+    if (matching.length > 1) {
+      throw codedError('SSH_ALIAS_AMBIGUOUS', '有多台保存的机器使用这个 SSH 别名，请在设置中分别填写连接参数。', { httpStatus: 409 })
+    }
+    const previous = matching[0]
+    const resolved = previous?.useSshConfig
+      ? resolveMachineSshConfig(previous, { text })
+      : (previous?.host === alias && resolveLiteralSshConfig(previous, { text })) || sshAliasTarget(alias, { text })
+    if (resolved.warnings.length) {
+      throw codedError('SSH_IMPORT_UNSUPPORTED', '此 SSH 别名包含需要手动配置的选项。' + resolved.warnings.join(' '), { httpStatus: 422 })
+    }
+    const record = {
+      ...previous,
+      id: previous?.id || machineId(),
+      name: previous?.name || alias,
+      host: resolved.host,
+      port: Number(resolved.port || previous?.port) || 22,
+      username: resolved.username || previous?.username || userInfo().username,
+      privateKeyPath: resolved.privateKeyPath || previous?.privateKeyPath || '',
+      agentSocket: resolved.agentSocket || '',
+      identitiesOnly: resolved.identitiesOnly,
+      proxy: resolved.proxy || previous?.proxy,
+      importedSshAlias: alias,
+    }
+    delete record.useSshConfig
+    const next = previous ? machines.map(machine => machine === previous ? record : machine) : [...machines, record]
+    saveMachines(next, store.currentId, false)
+    if (previous) machines[machineIndex(previous.id)] = record
+    else machines.push(record)
+    return record
   }
 
   /** Delete one machine (never auto-promotes a sibling). Shared by the
@@ -3375,65 +3192,41 @@ export async function apply(ctx, config) {
       })
       return hit || null
     })()
+    requireIndependentMachine(body)
+    if (body.useSshConfig !== false) requireIndependentMachine(savedRec)
     const savedPassword = savedRec ? await machinePassword(savedRec) : ''
     const cred = resolveProbeCredentials(body, savedRec, savedPassword)
-    // Issue #38: "test" on an ssh-config ALIAS resolves the alias first —
-    // the form holds the alias name, not the host it points at.
-    const probeBackend = String(cred.backend || config.backend || 'native')
-    const probeIsOpenssh = isSystemOpenSshBackend({ backend: probeBackend })
-    const aliasTarget = body.useSshConfig
-      ? resolveMachineSshConfig({
-          host: String(body.host || ''),
-          port: Number(body.port) || 22,
-          username: String(body.username || ''),
-          privateKeyPath: String(cred.privateKeyPath || ''),
-          proxy: cred.proxy,
-          useSshConfig: true,
-        }, { text: sshConfigText() })
-      : null
-    // Issue #50: a LITERAL host named by a Host block resolves through
-    // the file as well — the probe must dial what a real connect would.
-    const literalTarget = !body.useSshConfig
-      ? resolveLiteralSshConfig({ host: String(body.host || '') }, { text: sshConfigText() })
-      : null
-    const probeTarget = aliasTarget || literalTarget
-    // Issue #51: on the system-OpenSSH backend an alias is handed to `ssh`
-    // VERBATIM (see connectTargetFor) — resolving it here would stop the
-    // `Host` block from matching, so the ~/.ssh/config settings the probe
-    // is supposed to validate would be silently skipped.
     const probe = createPool({
       ...config,
-      backend: probeBackend,
-      host: probeTarget && !probeIsOpenssh ? probeTarget.host : String(body.host || config.host),
-      port: (probeTarget && !probeIsOpenssh && probeTarget.port) ? probeTarget.port : (Number(body.port) || config.port),
-      username: (probeTarget && !probeIsOpenssh && probeTarget.username) ? probeTarget.username : String(body.username || config.username),
+      backend: cred.backend,
+      host: String(body.host || savedRec?.host || config.host),
+      port: Number(body.port || savedRec?.port || config.port) || 22,
+      username: String(body.username || savedRec?.username || ''),
       password: cred.password,
-      privateKeyPath: (probeTarget && !probeIsOpenssh && probeTarget.privateKeyPath) ? probeTarget.privateKeyPath : String(cred.privateKeyPath || config.privateKeyPath),
+      privateKeyPath: cred.privateKeyPath,
       passphrase: cred.passphrase,
-      // Auth METHOD flags come from the merge too: a machine that
-      // authenticates through an agent or keyboard-interactive used to be
-      // probed with `useAgent: false`, i.e. with no auth method at all.
       useAgent: cred.useAgent,
-      agentSocket: (probeTarget && !probeIsOpenssh && probeTarget.agentSocket) || '',
-      identitiesOnly: !!(probeTarget && !probeIsOpenssh && probeTarget.identitiesOnly),
+      agentSocket: savedRec?.agentSocket || '',
+      identitiesOnly: !!savedRec?.identitiesOnly,
       keyboardInteractive: cred.keyboardInteractive,
       ...(cred.hostKeyMode ? { hostKeyMode: cred.hostKeyMode } : {}),
       ...(cred.sshBinary ? { sshBinary: cred.sshBinary } : {}),
-      proxy: (probeTarget && !probeIsOpenssh && probeTarget.proxy) ? probeTarget.proxy : cred.proxy,
+      proxy: cred.proxy,
       connectTimeoutMs: Math.min(Math.max(Number(body.connectTimeoutMs) || config.connectTimeoutMs, 2000), 30000),
       commandTimeoutMs: 10000,
-    }, { knownHostsFile })
+    }, poolOptions)
     // Same lazy resolution the active pool uses: if the merged password was
     // empty because the secret lives in the OS keychain, the pool asks again
     // at dial time instead of failing with "no credentials".
     probe.passwordResolver = async () => machinePassword(savedRec || {})
     const started = Date.now()
-    await probe.connect()
-    await probe.exec('true', { timeoutMs: 10000 })
-    probe.close()
+    try {
+      await probe.connect()
+      await probe.exec('true', { timeoutMs: 10000 })
+    } finally {
+      probe.close()
+    }
     const latencyMs = Date.now() - started
-    // Alias-aware: the probe connects to the RESOLVED host, while the
-    // registry stores the alias, so matching must go through the identity.
     const mi = machines.findIndex((m) => identityMatches(m, { host: probe.config.host, port: probe.config.port, username: probe.config.username }))
     if (mi >= 0) {
       machines[mi].lastConnectedAt = new Date().toISOString()
@@ -3452,9 +3245,6 @@ export async function apply(ctx, config) {
       // Tell the UI whether the probe leaned on the SAVED credential: with
       // an empty password box, "测试成功" otherwise looks impossible.
       usedSavedCredential: cred.usedSavedCredential,
-      // Issue #38: tell the settings page where an alias resolved to (and
-      // anything the plugin could not honour, e.g. a multi-hop ProxyJump).
-      alias: aliasTarget ? { name: aliasTarget.alias, host: aliasTarget.host, port: aliasTarget.port, user: aliasTarget.username, warnings: aliasTarget.warnings } : null,
     }
   }
   // ── in-process host API (ctx.dshRemote) building blocks ───────────────────
@@ -3490,6 +3280,7 @@ export async function apply(ctx, config) {
       const i = machineIndex(id)
       if (i < 0) throw codedError('MACHINE_NOT_FOUND', `machine not found: ${id}`)
       const rec = machines[i]
+      requireIndependentMachine(rec)
       return {
         ...identityOf(rec),
         record: rec,
@@ -3500,6 +3291,7 @@ export async function apply(ctx, config) {
     }
     const rec = !ephemeral && store.currentId && machineIndex(store.currentId) >= 0 ? machines[machineIndex(store.currentId)] : null
     const m = activeMachine()
+    requireIndependentMachine(m)
     if (!m || !m.host) {
       throw codedError('NO_ACTIVE_MACHINE', '当前没有活动远程机：请先在「远程工作区」设置里选择或连接一台机器。（保存的机器只是备用连接，不会自动成为当前机器。）')
     }
@@ -3870,6 +3662,7 @@ export async function apply(ctx, config) {
           const id = String(payload.machineId || '')
           const record = id ? machines[machineIndex(id)] : activeMachine()
           if (!record?.host) return sendJson(res, 404, { error: 'Choose an available remote server.' })
+          requireIndependentMachine(record)
           const identity = id ? identityOf(record) : { host: record.host, port: Number(record.port) || 22, username: record.username || '' }
           const target = { ...identity, alias: aliasOf(record), machineId: id || (machines.includes(record) ? record.id : ''), pinned: !!id }
           if (!(await isRemoteDir(p, id ? poolForMachine(target) : pool))) {
@@ -4025,57 +3818,15 @@ export async function apply(ctx, config) {
                 return sendJson(res, (err && err.httpStatus) || 500, { ok: false, error: String((err && err.message) || err) })
               }
             }
-            // Adopt a host selected from ~/.ssh/config and make it current.
-            // Re-read the config to pick up changes since the picker listed it.
             if (action === 'from-ssh-config') {
-              const alias = String(body.alias || body.host || '').trim()
-              if (!alias) return sendJson(res, 400, { ok: false, error: 'alias required' })
-              const known = listAliases(sshConfigText(true)).find((a) => a.alias === alias)
-              if (!known) {
-                return sendJson(res, 404, {
-                  ok: false,
-                  error: `~/.ssh/config 里没有 "${alias}"（改完文件后重新打开设置页即可刷新）`,
-                })
+              try {
+                const alias = String(body.alias || body.host || '').trim()
+                if (!alias) return sendJson(res, 400, { ok: false, error: 'alias required' })
+                const machine = importSshMachine(alias)
+                return sendJson(res, 200, { ok: true, machine: sanitizeMachine(machine), machines: machinesForClient(), currentId: store.currentId })
+              } catch (error) {
+                return sendJson(res, error.httpStatus || 500, { ok: false, error: error.message })
               }
-              const existing = machines.find((m) => m.useSshConfig && String(m.host) === alias)
-              let rec = existing
-              if (!rec) {
-                rec = {
-                  id: machineId(),
-                  name: alias,
-                  host: alias,
-                  useSshConfig: true,
-                  port: Number(known.port) || 22,
-                  username: String(known.user || ''),
-                  password: '',
-                  privateKeyPath: '',
-                  passphrase: '',
-                  workspace: '',
-                  hostKeyMode: '',
-                  useAgent: false,
-                  keyboardInteractive: false,
-                  backend: 'native',
-                  sshBinary: '',
-                  credentialBackend: 'plain',
-                  recentWorkspaces: [],
-                  lastConnectedAt: null,
-                  latencyMs: null,
-                }
-                machines.push(rec)
-                saveMachines(machines, store.currentId, false)
-              }
-              // Making it current is the whole point of the click: the picker and
-              // every session route then act on this machine.
-              const okSet = await setCurrent(rec.id)
-              if (!okSet) return sendJson(res, 500, { ok: false, error: 'could not activate the machine' })
-              return sendJson(res, 200, {
-                ok: true,
-                created: !existing,
-                machine: sanitizeMachine(rec),
-                machines: machinesForClient(),
-                currentId: store.currentId,
-                ...status(),
-              })
             }
             if (action === 'delete') {
               try {
@@ -4267,10 +4018,7 @@ export async function apply(ctx, config) {
       kind: 'exact',
       path: '/dsh-remote/ssh-config',
       handler: async (req, res) => {
-        // GET lists hosts. POST {action:'open'|'reveal'} opens THAT file on the
-        // machine running DSH — the same affordance as the audit log. The path
-        // is always sshConfigPath(); a path in the body is ignored, so this is
-        // not a general file launcher.
+        // GET previews the user's SSH aliases for explicit import. POST opens the DSH config.
         if (req.method === 'POST') {
           try {
             const body = parseJsonObject(await readBody(req))
@@ -4278,11 +4026,7 @@ export async function apply(ctx, config) {
             if (action !== 'open' && action !== 'reveal') {
               return sendJson(res, 400, { ok: false, error: 'action must be open | reveal' })
             }
-            const file = sshConfigPath()
-            mkdirSync(path.dirname(file), { recursive: true })
-            // Create an empty config so the editor has a file. Never truncate
-            // one the user already wrote.
-            if (!existsSync(file)) writeFileSync(file, '', { encoding: 'utf8', mode: 0o600 })
+            const file = sshConfigFile()
             const r = await openLocalPath(file, action)
             if (!r.ok) return sendJson(res, r.httpStatus || 500, { ok: false, error: r.error, file })
             return sendJson(res, 200, { ok: true, action, file, how: r.how })
@@ -4293,11 +4037,6 @@ export async function apply(ctx, config) {
         if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: 'method not allowed' })
         try {
           const text = readSshConfigText()
-          // Issue #73: the settings page lists the hosts of ~/.ssh/config the way
-          // VSCode Remote-SSH does, so this must include EVERY concrete alias —
-          // `importableEntries` filtered out a bare `Host mybox` with no options,
-          // which is a perfectly normal entry to connect to. `host` is kept as an
-          // alias of `alias` so existing callers keep working.
           const entries = listAliases(text).map((a) => ({
             host: a.alias,
             alias: a.alias,

@@ -65,8 +65,8 @@ export class PreferredKeyAgent extends ssh2.BaseAgent {
  *
  * Two backends exist (issue #51): the native one below, which speaks SSH itself
  * via ssh2, and the "system OpenSSH" one (lib/openssh.js), which delegates to
- * the local `ssh` executable so GSSAPI/Kerberos and the rest of the user's
- * `~/.ssh/config` are honoured. Both expose one identical surface, so every
+ * the local `ssh` executable with the plugin's private ssh_config for options
+ * such as GSSAPI/Kerberos. Both expose one identical surface, so every
  * caller can keep using `new SshPool(...)`-shaped code — this factory only has
  * to decide which class to instantiate.
  */
@@ -441,7 +441,7 @@ export class SshPool {
         // error — which reads as "the plugin lost my settings" rather than "this
         // machine has no agent". Track the intent so the failure can say which.
         let agentRequested = false
-        // `IdentityAgent` from ~/.ssh/config (agentSocket) wins over the
+        // The saved `IdentityAgent` (agentSocket) wins over the
         // process SSH_AUTH_SOCK, exactly as in ssh; `none` turns the agent off.
         const agentSocket = String(this.config.agentSocket || '')
         const sockPath = agentSocket === 'none' ? '' : (agentSocket || process.env.SSH_AUTH_SOCK || '')
