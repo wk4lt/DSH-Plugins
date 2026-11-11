@@ -30,7 +30,7 @@ dsh plugin --profile desktop add 'file:./plugins/dsh-remote' --registry $Registr
 
 ## 使用
 
-- **设置 → 远程工作区 → 远程服务器**列出已保存的连接和来自 SSH 配置的主机。已保存的连接可以编辑、测试或删除。删除后，关联映射会显示「服务器已移除」，可编辑映射以选择另一台服务器。可用「打开 SSH 配置」管理 SSH 配置中的主机条目。
+- **设置 → 远程工作区 → 远程服务器**列出 DSH 保存的连接，可编辑、测试或删除。点击「从 ~/.ssh/config 导入」可选择一个 SSH 别名，把解析出的连接参数保存到 DSH。升级后需要导入旧版保存的别名，或编辑它并填写实际连接参数。原机器 ID 继续用于关联工作区和目录映射。
 - **目录映射**按服务器分组。展开对应服务器的新增或编辑弹窗，选择已有本地目录并填写远端绝对路径。
 - **工作区选择器 → 远程**选择服务器后，手动输入远端目录，或使用「浏览」和「从主目录浏览」选择目录。后者从当前 SSH 用户的主目录开始。勾选「映射到已有本地目录」时，插件验证两端目录并记录对应关系，使用选中的 checkout 作为手动同步的目录。未勾选时，插件创建一个空的托管镜像。两种方式都通过 SSH 查看和操作远端项目。
 - **工作区选择器 → 本地**可以打开同一个 checkout，使用 DSH 原生工具在本机操作。
@@ -41,4 +41,6 @@ dsh plugin --profile desktop add 'file:./plugins/dsh-remote' --registry $Registr
 
 升级到 0.1.6 后，旧的托管远程会话可以直接打开。以前直接以 checkout 路径打开的会话按本地会话处理。从「远程」重新选择服务器和项目目录可建立独立的远程会话。
 
-映射和同步记录保存在本机的 `$DSH_HOME/remote-workspaces` 下。
+连接、映射和同步记录保存在 `$DSH_HOME/remote-workspaces` 下，默认使用 `~/.dsh/remote-workspaces`。连接使用其中的 `machines.json`。OpenSSH 后端和远程终端加载同目录下的 `ssh_config`，可用「打开插件 SSH 配置」编辑 Kerberos 等 OpenSSH 选项。
+
+包含 `ProxyCommand` 或多跳 `ProxyJump` 的连接需在插件的 `ssh_config` 中手动配置，并选择 OpenSSH 后端。

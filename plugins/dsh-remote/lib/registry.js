@@ -152,6 +152,7 @@ export function resolveProbeCredentials(body = {}, rec = null, storedPassword = 
   const formProxy = form.proxy && form.proxy.host ? form.proxy : null
   const savedProxy = saved.proxy && saved.proxy.host ? saved.proxy : null
   const baseProxy = formProxy || savedProxy
+  const savedProxyForHost = baseProxy?.host === savedProxy?.host ? savedProxy : null
   const proxy = baseProxy
     ? {
         host: String(baseProxy.host),
@@ -161,6 +162,8 @@ export function resolveProbeCredentials(body = {}, rec = null, storedPassword = 
           ? str(formProxy.password)
           : str(savedProxy && savedProxy.password),
         privateKeyPath: str(baseProxy.privateKeyPath),
+        agentSocket: str(baseProxy.agentSocket || savedProxyForHost?.agentSocket),
+        identitiesOnly: !!(baseProxy.identitiesOnly || savedProxyForHost?.identitiesOnly),
       }
     : undefined
 
@@ -274,7 +277,7 @@ export function applyMachine(config, m) {
   config.password = m.password || ''
   config.privateKeyPath = m.privateKeyPath || ''
   config.passphrase = m.passphrase || ''
-  // IdentityAgent / IdentitiesOnly from ~/.ssh/config (set by withSshConfig).
+  // IdentityAgent and IdentitiesOnly can be saved by the SSH alias importer.
   config.agentSocket = m.agentSocket || ''
   config.identitiesOnly = !!m.identitiesOnly
   config.workspace = m.workspace || (config.workspace || '')

@@ -144,22 +144,34 @@ test('an empty server list can add its first machine, edit it, and open mapping 
   }
 })
 
-test('settings delete saved connections after confirmation and identify SSH config entries', async () => {
+test('settings explicitly import SSH aliases and delete saved connections without rediscovery', async () => {
   const deleted = []
+  const imported = []
+  let configReads = 0
   let machines = [{ ...machine, useSshConfig: true }]
   let fail = true
   const ui = mountClient({ fetch: async (url, opts) => {
     if (url.endsWith('/machines') && opts.method === 'POST') {
-      deleted.push(JSON.parse(opts.body))
+      const request = JSON.parse(opts.body)
+      if (request.action === 'from-ssh-config') {
+        imported.push(request.alias)
+        machines = [machine]
+        return response({ machine, machines })
+      }
+      deleted.push(request)
       if (fail) return { ok: false, status: 500, json: async () => ({ error: 'fixture delete failed' }) }
       machines = []
       return response({ machines, currentId: null })
     }
     if (url.endsWith('/machines')) return response({ machines })
     if (url.endsWith('/mappings')) return response({ mappings })
-    if (url.endsWith('/ssh-config')) return response({ entries: [
-      { alias: machine.host, user: 'me', port: 22 }, { alias: 'ssh-only', user: 'me', port: 22 },
-    ] })
+    if (url.endsWith('/ssh-config')) {
+      configReads++
+      return response({ entries: [
+        { alias: machine.host, hostName: 'dev', user: 'me', port: 22 },
+        { alias: 'ssh-only', hostName: 'other', user: 'me', port: 22 },
+      ] })
+    }
     throw new Error('unexpected request: ' + url)
   } })
   try {
@@ -175,7 +187,22 @@ test('settings delete saved connections after confirmation and identify SSH conf
       return ui.settle()
     }
     let tree = await ui.settle()
-    assert.match(ui.text(tree), /ssh-only.*来自 SSH 配置/)
+    assert.equal(configReads, 0)
+    assert.match(ui.text(tree), /旧 SSH 别名需要导入/)
+    assert(!ui.text(tree).includes('ssh-only'))
+    await ui.button(tree, /^从 .* 导入$/).el.props.onClick()
+    tree = await ui.settle()
+    const importer = ui.components(tree).find(node => node.type.name === 'SettingsEditor')
+    const select = ui.elements(importer.props.children).find(node => node.type === 'select')
+    assert.equal(configReads, 1)
+    assert.equal(ui.button(importer.props.footer, /^保存$/).disabled, true)
+    select.props.onChange({ target: { value: machine.host } })
+    tree = await ui.settle()
+    const selected = ui.components(tree).find(node => node.type.name === 'SettingsEditor')
+    await ui.button(selected.props.footer, /^保存$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.deepEqual(imported, ['dev'])
+    assert.match(ui.text(tree), /已导入「开发机」/)
     tree = await remove(tree, false)
     assert.deepEqual(deleted, [])
     tree = await remove(tree, true)
@@ -185,9 +212,13 @@ test('settings delete saved connections after confirmation and identify SSH conf
     tree = await remove(tree, true)
     assert.deepEqual(deleted, [{ action: 'delete', id: 'dev' }, { action: 'delete', id: 'dev' }])
     assert.match(ui.text(tree), /已移除「开发机」的保存连接/)
-    assert.match(ui.text(tree), /devme@dev:22来自 SSH 配置/)
+    assert(!ui.text(tree).includes('me@dev:22'))
     assert.match(ui.text(tree), /服务器已移除 · 2/)
     assert(!ui.buttons(tree).some(button => button.label === '删除'))
+    await ui.button(tree, /^刷新$/).el.props.onClick()
+    tree = await ui.settle()
+    assert.equal(configReads, 1)
+    assert(!ui.text(tree).includes('me@dev:22'))
   } finally {
     ui.dispose()
   }

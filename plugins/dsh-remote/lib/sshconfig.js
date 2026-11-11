@@ -1,15 +1,9 @@
 // dsh-remote — ~/.ssh/config reading and OpenSSH alias resolution (issue #38).
 //
-// ## Why this module exists
+// Used by the explicit import flow to snapshot a host into the machine registry.
+// Previously saved aliases can keep their machine ID and explicit overrides.
 //
-// A saved machine can be an ALIAS from the user's ssh config: the registry keeps
-// `{ host: '<alias>', useSshConfig: true }` and NOTHING else — no HostName, no
-// user, no port, no key path. Every connect resolves that alias against
-// `~/.ssh/config` as it is RIGHT NOW, which is what VSCode Remote-SSH does with
-// the same file: editing the config (a new jump host, a rotated IdentityFile, a
-// different port) is picked up without re-importing anything into the plugin.
-//
-// ## What is read
+// // ## What is read
 //
 // Host / HostName / User / Port / IdentityFile / ProxyJump / ProxyCommand /
 // IdentityAgent / IdentitiesOnly. `IdentityFile` is imported as a PATH
@@ -27,10 +21,9 @@
 //     (falling back to the including file's directory), depth- and cycle-limited.
 //   • backslash line continuations.
 //
-// The module is pure (I/O is injectable), so it is unit-testable without a real
-// home directory — see test/sshconfig.test.js.
+// File reads can be injected to resolve a config outside the real home directory.
 
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir, hostname as osHostname, userInfo } from 'node:os'
 import path from 'node:path'
 
@@ -265,7 +258,7 @@ export function listAliases(text) {
       out.push(resolveSshHost(pattern, text))
     }
   }
-  return out.sort((a, b) => compareText(a.alias, b.alias))
+  return out.sort((a, b) => a.alias < b.alias ? -1 : (a.alias > b.alias ? 1 : 0))
 }
 
 /** Glob match for ssh host patterns (`*`, `?`), case-insensitive. */
@@ -500,17 +493,9 @@ export function sshAliasTarget(alias, opts = {}) {
 }
 
 /**
- * Effective connect identity for a LITERAL machine (issue #50).
- *
- * A machine saved with literal host/user/port/key holds a COPY of what may also
- * be written in ~/.ssh/config, and the copy goes stale the moment the file is
- * edited. The file is the single source for any host it NAMES: when a Host
- * block matches the machine's literal host — with at least one positive pattern
- * that is not the bare `*` — the resolved values win per field and the record
- * fills the gaps. A bare `Host *` block deliberately does NOT name a host:
- * treating universal defaults as an override would hijack every saved machine
- * at once. Group patterns (`*.corp`, `web-?`) DO name hosts, exactly as ssh
- * itself applies them to a literal dial.
+ * Resolve a named Host block when importing into a saved literal machine.
+ * Host-specific options override stored fields. A bare `Host *` block is
+ * skipped so it cannot replace values already saved for this machine.
  *
  * `port` is 0 (not 22) when the file says nothing, so the caller falls back to
  * the record instead of the default.
@@ -552,7 +537,7 @@ export function resolveLiteralSshConfig(machine, opts = {}) {
 }
 
 /**
- * Effective connect identity for a saved machine.
+ * Resolve a saved legacy alias for import.
  *
  * A machine in ALIAS mode (`useSshConfig: true`, `host` = the alias) inherits
  * everything from ~/.ssh/config; a field the user filled in explicitly still
@@ -587,193 +572,5 @@ export function resolveMachineSshConfig(machine, opts = {}) {
     identitiesOnly: target.identitiesOnly,
     proxy,
     warnings,
-  }
-}
-
-function compareText(left, right) {
-  return left < right ? -1 : left > right ? 1 : 0
-}
-
-// ── Writing: the managed Host block (issue #50) ─────────────────────────────
-//
-// The four connection fields (host/user/port/key) have ONE home: ~/.ssh/config.
-// When the plugin saves a literal machine it upserts a Host block tagged with
-// MANAGED_MARK, so the file and the registry can never drift — and so the
-// plugin can tell ITS OWN block apart from one the user wrote. Two rules keep
-// the file safe:
-//   • a Host block without the marker is never touched — a same-named user
-//     block is a CONFLICT, reported to the caller instead of overwritten;
-//   • inside a managed block, lines the plugin does not own (a user-added
-//     `ForwardAgent yes`, a comment) survive an update — only the four known
-//     parameters are rewritten.
-
-/** Marker comment that tags a Host block as owned by dsh-remote. */
-export const MANAGED_MARK = '# dsh-remote: managed'
-
-/** Parameters the managed block rewrites (lowercase). */
-const MANAGED_PARAMS = new Set(['hostname', 'user', 'port', 'identityfile'])
-
-/** Read the RAW config text — no Include expansion (a write targets ONE file). */
-export function readRawSshConfig(filePath = sshConfigPath()) {
-  try {
-    const text = readFileSync(filePath, 'utf8')
-    return typeof text === 'string' ? text : ''
-  } catch {
-    return ''
-  }
-}
-
-/** Quote one value for a config line when it contains whitespace. */
-function quoteCfg(value) {
-  const s = String(value)
-  return /[\s#]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s
-}
-
-/** The values a managed block must carry for these fields ('' = omit). */
-function desiredValues(fields) {
-  const alias = String(fields.alias || '').trim()
-  const hostName = String(fields.hostName || '').trim()
-  const port = Number(fields.port) || 0
-  return {
-    hostname: hostName && hostName !== alias ? hostName : '',
-    user: String(fields.user || '').trim(),
-    port: port && port !== 22 ? port : '',
-    identityfile: String(fields.identityFile || '').trim(),
-  }
-}
-
-/** Render the owned body lines of a managed block. */
-function desiredLines(fields) {
-  const want = desiredValues(fields)
-  const out = []
-  if (want.hostname) out.push(`  HostName ${quoteCfg(want.hostname)}`)
-  if (want.user) out.push(`  User ${quoteCfg(want.user)}`)
-  if (want.port) out.push(`  Port ${want.port}`)
-  if (want.identityfile) out.push(`  IdentityFile ${quoteCfg(want.identityfile)}`)
-  return out
-}
-
-/**
- * Locate the MANAGED Host block for `alias` in raw config lines.
- * The marker must be the nearest non-blank line above the Host line; a block
- * that names the alias without the marker is the user's, not ours.
- */
-function locateManagedBlock(lines, alias) {
-  const wanted = alias.toLowerCase()
-  for (let i = 0; i < lines.length; i += 1) {
-    const m = lines[i].match(/^\s*host\s+(.+?)\s*$/i)
-    if (!m) continue
-    const names = splitValue(m[1]).map((p) => p.toLowerCase())
-    if (!names.includes(wanted)) continue
-    let j = i - 1
-    while (j >= 0 && lines[j].trim() === '') j -= 1
-    if (j < 0 || lines[j].trim().toLowerCase() !== MANAGED_MARK) continue
-    let end = lines.length
-    for (let k = i + 1; k < lines.length; k += 1) {
-      if (/^\s*(host|match)\s/i.test(lines[k])) { end = k; break }
-    }
-    return { markerLine: j, hostLine: i, end }
-  }
-  return null
-}
-
-/** Whether an UNMANAGED Host block names `alias` (exact token, case-insensitive). */
-function hasUnmanagedConflict(lines, alias) {
-  const wanted = alias.toLowerCase()
-  for (let i = 0; i < lines.length; i += 1) {
-    const m = lines[i].match(/^\s*host\s+(.+?)\s*$/i)
-    if (!m) continue
-    const names = splitValue(m[1]).map((p) => p.toLowerCase())
-    if (!names.includes(wanted)) continue
-    let j = i - 1
-    while (j >= 0 && lines[j].trim() === '') j -= 1
-    if (j >= 0 && lines[j].trim().toLowerCase() === MANAGED_MARK) continue // ours
-    return true
-  }
-  return false
-}
-
-/**
- * Insert or refresh the managed Host block for a saved machine.
- *
- * @param {string} rawText - the RAW ~/.ssh/config text ('' when absent).
- * @param {{alias: string, hostName?: string, user?: string, port?: number|string, identityFile?: string}} fields
- * @returns {{status: 'appended'|'updated'|'unchanged'|'conflict'|'invalid', text: string}}
- *   'conflict' — an unmanaged block already names the alias (text untouched);
- *   'invalid' — the alias can never be a safe Host token (space/wildcard).
- */
-export function upsertManagedHostBlock(rawText, fields) {
-  const text = String(rawText || '')
-  const alias = String((fields && fields.alias) || '').trim()
-  if (!alias || /[\s*?!,]/.test(alias)) return { status: 'invalid', text }
-  const lines = text.split('\n')
-  if (hasUnmanagedConflict(lines, alias)) return { status: 'conflict', text }
-
-  const want = desiredValues({ ...fields, alias })
-  const found = locateManagedBlock(lines, alias)
-  if (!found) {
-    const block = [MANAGED_MARK, `Host ${alias}`, ...desiredLines({ ...fields, alias })]
-    const trimmedEnd = text.replace(/\s+$/, '')
-    const prefix = trimmedEnd === '' ? '' : trimmedEnd + '\n\n'
-    return { status: 'appended', text: prefix + block.join('\n') + '\n' }
-  }
-
-  // Compare what the block HAS with what it MUST have; a rewrite that changes
-  // nothing would only cost the file's mtime.
-  const current = parseHostBlocks(lines.slice(found.hostLine, found.end).join('\n'))[0]
-  const cur = (current && current.values) || {}
-  const same = ['hostname', 'user', 'port', 'identityfile']
-    .every((k) => String(cur[k] ?? '') === String(want[k] ?? ''))
-  if (same) return { status: 'unchanged', text }
-
-  // Rewrite only the four owned parameters; user lines inside OUR block stay.
-  const body = lines.slice(found.hostLine + 1, found.end)
-  const kept = body.filter((l) => {
-    const m = l.match(/^\s*(\S+)\s/)
-    return !m || !MANAGED_PARAMS.has(m[1].toLowerCase())
-  })
-  const next = [
-    ...lines.slice(0, found.hostLine + 1),
-    ...desiredLines({ ...fields, alias }),
-    ...kept,
-    ...lines.slice(found.end),
-  ]
-  return { status: 'updated', text: next.join('\n') }
-}
-
-/**
- * Remove the managed block for `alias` (used when a machine is RENAMED away:
- * the old block is the plugin's own artifact of that edit). Deleting a machine
- * deliberately does NOT call this — the Host block is the user's ssh access,
- * not plugin state. Unmanaged blocks are never removed.
- *
- * @returns {{status: 'removed'|'absent', text: string}}
- */
-export function removeManagedHostBlock(rawText, alias) {
-  const text = String(rawText || '')
-  const name = String(alias || '').trim()
-  if (!name) return { status: 'absent', text }
-  const lines = text.split('\n')
-  const found = locateManagedBlock(lines, name)
-  if (!found) return { status: 'absent', text }
-  let start = found.markerLine
-  while (start > 0 && lines[start - 1].trim() === '') start -= 1
-  const next = [...lines.slice(0, start), ...lines.slice(found.end)]
-  return { status: 'removed', text: next.join('\n') }
-}
-
-/**
- * Persist a config text, creating ~/.ssh first. Permissions follow OpenSSH's
- * expectations on POSIX (dir 0700, file 0600) and are a no-op elsewhere.
- */
-export function writeSshConfig(text, filePath = sshConfigPath(), io = {}) {
-  const mkdir = io.mkdir || ((p) => mkdirSync(p, { recursive: true }))
-  const write = io.write || ((p, data) => writeFileSync(p, data, 'utf8'))
-  const chmod = io.chmod || ((p, mode) => { try { chmodSync(p, mode) } catch { /* no modes here */ } })
-  mkdir(path.dirname(filePath))
-  write(filePath, String(text))
-  if (process.platform !== 'win32') {
-    chmod(path.dirname(filePath), 0o700)
-    chmod(filePath, 0o600)
   }
 }

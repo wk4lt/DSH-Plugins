@@ -17,6 +17,7 @@
 const { spawn } = require('node:child_process')
 const { existsSync, fstatSync, readFileSync } = require('node:fs')
 const path = require('node:path')
+const { ensurePrivateSshConfig, sshConnectionArgs } = require('./private-ssh-config.cjs')
 
 /** Name of the marker the host half writes into every local mirror root. */
 const META_FILE = '.dsh-remote-meta.json'
@@ -76,7 +77,7 @@ function matchMachine(meta, registry) {
   const list = registry && Array.isArray(registry.list) ? registry.list : []
   const port = Number(meta.port || 22)
   if (meta.alias) {
-    const byAlias = list.find((m) => m && m.host === meta.alias)
+    const byAlias = list.find(m => m && (m.importedSshAlias === meta.alias || (m.useSshConfig && m.host === meta.alias)))
     if (byAlias) return byAlias
   }
   return list.find((m) => m && m.host === meta.host
@@ -154,18 +155,9 @@ function isWindowsRemotePath(p) {
  * @param {object} [machine] - saved connection, for the key and transport hints
  * @returns {string[]}
  */
-function buildSshArgs(target, machine) {
-  const args = ['-tt', '-o', 'HostName=' + target.host, '-p', String(target.port || 22)]
-  const alias = target.alias || (machine && machine.useSshConfig ? machine.host : '')
-  if (alias) {
-    if (target.username) args.push('-l', target.username)
-    args.push(String(alias))
-  } else {
-    const key = machine && machine.privateKeyPath
-    if (key && !machine.useAgent) args.push('-i', String(key))
-    const user = target.username || (machine && machine.username) || ''
-    args.push(user ? `${user}@${target.host}` : String(target.host))
-  }
+function buildSshArgs(target, machine, configFile = 'none') {
+  const options = { ...machine, host: target.host, port: target.port || 22, username: target.username || machine?.username, sshConfigFile: configFile }
+  const args = ['-tt', ...sshConnectionArgs(options), '--', String(target.host)]
   // A Windows workspace cannot be reached with the POSIX line: the remote's
   // default shell may be cmd or PowerShell, and picking one would be a guess.
   // Opening ssh with no command leaves the remote's own default shell in charge,
@@ -248,6 +240,7 @@ function resolveTarget(input = {}) {
     ? registry?.list?.find(entry => entry.id === mirror.meta.machineId)
     : matchMachine(mirror.meta, registry)
   if (mirror.meta.machineId && !machine) return { found: true, error: 'The saved SSH server is unavailable.' }
+  if (machine?.useSshConfig) return { found: true, error: 'Import the saved SSH alias in dsh-remote settings before connecting.' }
   const target = {
     host: mirror.meta.host,
     port: mirror.meta.port || (machine && machine.port) || 22,
@@ -335,18 +328,17 @@ async function main(argv = process.argv.slice(2), deps = {}) {
     return handover(localShell(platform, env), platform === 'win32' ? [] : ['-l'])
   }
   if (resolved.machine) {
-    const { resolveLiteralSshConfig, resolveMachineSshConfig } = await import('./sshconfig.js')
     const machine = resolved.machine
-    const current = (machine.useSshConfig ? resolveMachineSshConfig(machine) : resolveLiteralSshConfig(machine)) || machine
     const { host, port, username } = resolved.target
-    if ((current.host || machine.host) !== host || (Number(current.port || machine.port) || 22) !== Number(port)
-      || (current.username || machine.username || '') !== username) {
+    if (machine.host !== host || (Number(machine.port) || 22) !== Number(port)
+      || (machine.username || '') !== username) {
       write('[dsh-remote] The saved SSH target no longer matches this workspace. Open a new remote workspace for the new target.\n')
       return exit(1)
     }
   }
-  const ssh = sshBinary(platform, env)
-  const args = buildSshArgs(resolved.target, resolved.machine)
+  const ssh = resolved.machine?.sshBinary || sshBinary(platform, env)
+  const configFile = options.machines ? ensurePrivateSshConfig(path.dirname(options.machines)) : 'none'
+  const args = buildSshArgs(resolved.target, resolved.machine, configFile)
   const user = resolved.target.username || (resolved.machine && resolved.machine.username) || ''
   process.stderr.write(`[dsh-remote] connecting to ${user ? user + '@' : ''}${resolved.target.host}…\n`)
   if (isWindowsRemotePath(resolved.target.remotePath)) {

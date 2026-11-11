@@ -10,7 +10,7 @@
 // ssh2 knows how to present.
 //
 // This backend delegates the transport to the LOCAL `ssh` executable, so every
-// `~/.ssh/config` feature the user already relies on applies: gssapi-with-mic,
+// OpenSSH feature can be configured in the DSH-owned file: gssapi-with-mic,
 // ProxyJump, ProxyCommand, ControlPath, Host aliases, IdentityFile,
 // PKCS11Provider, Match blocks… Anything OpenSSH can do, this backend can do,
 // because OpenSSH is the one doing it.
@@ -64,6 +64,7 @@ import path from 'node:path'
 import { Duplex } from 'node:stream'
 import { buildSftpSurface } from './sftp-surface.js'
 import { truncate } from './paths.js'
+import { sshConnectionArgs, sshOptionValue } from './private-ssh-config.cjs'
 
 // The SFTP protocol engine lives at lib/protocol/SFTP.js inside ssh2 and is not
 // part of its public API. Creating it through createRequire keeps this module
@@ -184,10 +185,8 @@ export function sshBinaryAvailable(binary) {
 /**
  * Options shared by every `ssh` invocation for this target.
  *
- * Deliberately NOT passed: PreferredAuthentications / GSSAPIAuthentication /
- * PubkeyAcceptedKeyTypes / IdentitiesOnly-from-the-alias / ProxyJump-from-the-
- * alias. Those must come from the user's `~/.ssh/config` — overriding them is
- * precisely what would break the enterprise setups this backend exists for.
+ * PreferredAuthentications, GSSAPIAuthentication and other advanced options
+ * can be supplied in the plugin's private ssh_config.
  *
  * @param {object} config - the pool config.
  * @param {object} [opts]
@@ -196,30 +195,17 @@ export function sshBinaryAvailable(binary) {
  *   interactive prompt, askpass included) and the prompt count bounded instead.
  */
 export function baseSshArgs(config, { forSecret = false } = {}) {
-  const args = []
-  if (config.pinnedHost) args.push('-o', 'HostName=' + config.pinnedHost)
-  if (config.port && (config.pinnedHost || Number(config.port) !== 22)) args.push('-p', String(Number(config.port)))
-  if (config.username) args.push('-l', String(config.username))
-  if (config.privateKeyPath) args.push('-i', String(config.privateKeyPath))
-  // An explicit jump host — the same shape the native backend's `proxy` takes.
-  // A jump host that comes from ~/.ssh/config needs nothing here.
-  const proxy = config.proxy
-  if (proxy && proxy.host) {
-    const user = proxy.username ? `${proxy.username}@` : ''
-    const port = proxy.port && Number(proxy.port) !== 22 ? `:${Number(proxy.port)}` : ''
-    args.push('-J', `${user}${proxy.host}${port}`)
-  }
+  const args = sshConnectionArgs(config)
   // An explicit known_hosts file (tests keep loopback keys OUT of the user's
   // real ~/.ssh/known_hosts with this; ssh ignores $HOME on some platforms).
   // Checking strength is unchanged — StrictHostKeyChecking below still applies.
-  if (config.knownHostsFile) args.push('-o', `UserKnownHostsFile=${config.knownHostsFile}`)
+  if (config.knownHostsFile) args.push('-o', 'UserKnownHostsFile=' + sshOptionValue(config.knownHostsFile))
   args.push(...hostKeyArgs(config))
   const connectSecs = Math.max(1, Math.round((Number(config.connectTimeoutMs) || 15000) / 1000))
   args.push('-o', `ConnectTimeout=${connectSecs}`, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3')
   // Without a configured secret we must not hang on an interactive prompt:
   // BatchMode makes ssh fail fast instead, and leaves key/agent/GSSAPI intact.
-  if (!forSecret) args.push('-o', 'BatchMode=yes')
-  else args.push('-o', 'NumberOfPasswordPrompts=1')
+  args.push('-o', forSecret ? 'NumberOfPasswordPrompts=1' : 'BatchMode=yes')
   return args
 }
 
@@ -379,6 +365,7 @@ export class SystemOpenSshPool {
   constructor(config, opts = {}) {
     this.config = config
     this._knownHostsFile = opts.knownHostsFile
+    this._sshConfigFile = opts.sshConfigFile
     this.client = null
     this.connecting = null
     this.proxyPool = null
@@ -410,13 +397,12 @@ export class SystemOpenSshPool {
    */
   _argConfig() {
     const kh = typeof this._knownHostsFile === 'function' ? this._knownHostsFile() : this._knownHostsFile
-    return kh ? { ...this.config, knownHostsFile: kh } : this.config
+    const sshConfigFile = typeof this._sshConfigFile === 'function' ? this._sshConfigFile() : this._sshConfigFile
+    return { ...this.config, knownHostsFile: kh || this.config.knownHostsFile, sshConfigFile: sshConfigFile || this.config.sshConfigFile }
   }
 
-  /** The destination OpenSSH should connect to (an alias passes through). */
+  /** The saved destination, also used to match the private config's Host blocks. */
   destination() {
-    // A bare alias resolves through ~/.ssh/config inside ssh itself, so it is
-    // handed over untouched; user/port ride on `-l`/`-p` when recorded.
     return String(this.config.host || '')
   }
 

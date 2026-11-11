@@ -160,7 +160,7 @@ function parentOf(p, platform) {
  *   keys (all throw `INTERNAL` here when missing, never at require time):
  *   · `listMachinesView()` → `{machines, currentId}` (sanitized views);
  *   · `upsertMachineRecord(body)` → `{machine, machines, currentId, warning?,
- *      warningDetail?, sshConfigWarning?}`; throws HOST_REQUIRED / coded errors;
+ *      warningDetail?}`; throws HOST_REQUIRED / coded errors;
  *   · `removeMachineRecord(id)` → `{machines, currentId}`; throws
  *      MACHINE_NOT_FOUND;
  *   · `setCurrentForApi(id|null)`; throws MACHINE_NOT_FOUND;
@@ -245,14 +245,11 @@ export function createHostApi(deps = {}) {
       throw asApiError(err, { host: body.host, port: body.port })
     }
     emit('machines')
-    // Non-fatal problems the save could not throw for: the OS secure store
-    // refused the password, or ~/.ssh/config already names this host with a
-    // user-owned block. They are collected into one string list per contract.
+    // Collect non-fatal credential storage problems into the API's warnings list.
     const warnings = []
     if (result && result.warning) {
       warnings.push(String(result.warningDetail ? `${result.warning}: ${result.warningDetail}` : result.warning))
     }
-    if (result && result.sshConfigWarning) warnings.push(String(result.sshConfigWarning))
     return {
       machine: withGroup(scrub(result && result.machine)),
       machines: scrub(Array.isArray(result && result.machines) ? result.machines : []).map(withGroup),
