@@ -6,7 +6,7 @@ import { loadAgents, parseAgentFile } from '../agent-files.js';
 import { compileAgent } from '../agent-presets.js';
 import { apply as applyPolicy } from '../mcp-policy.js';
 
-test('the shipped matrix is preserved on both platforms, with Debug patches enabled', async () => {
+test('the shipped matrix is preserved on both platforms, with Debug patches and jobs enabled', async () => {
   const agents = await loadAgents({ home: join(tmpdir(), 'dsh-absent-agent-home') });
   for (const agent of agents) for (const platform of ['win32', 'linux']) {
     const preset = compileAgent(agent, platform);
@@ -19,6 +19,7 @@ test('the shipped matrix is preserved on both platforms, with Debug patches enab
     assert.equal(find('tool-fs').config.write, ['Design', 'Develop'].includes(agent.name));
     assert.equal(find('tool-fs').config.edit, agent.name !== 'Test');
     assert.equal(find('tool-fs').config.applyPatch, ['Develop', 'Debug'].includes(agent.name));
+    assert.deepEqual(find('tool-jobs'), { id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs' });
     assert.equal(!!find(`tool-${platform === 'win32' ? 'pwsh' : 'bash'}`), agent.name !== 'Design');
     assert.equal(find(`tool-${platform === 'win32' ? 'bash' : 'pwsh'}`), undefined);
     assert.equal(find('mcp-policy'), undefined);

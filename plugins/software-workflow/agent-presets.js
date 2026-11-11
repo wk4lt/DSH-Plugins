@@ -3,6 +3,7 @@ export function compileAgent(agent, platform = process.platform) {
   const plugins = [
     { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: agent.body } },
     { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { write, edit, applyPatch, readImage } },
+    { id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs' },
   ];
   if (search) plugins.push({ id: 'tool-fs-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false } });
   // Runtime registration does not pass through Loader's !!js evaluator.
