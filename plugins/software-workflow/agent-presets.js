@@ -4,6 +4,13 @@ export function compileAgent(agent, platform = process.platform) {
     { id: 'persona', name: '@deepseek-ai/dsh-persona', config: { prefix: agent.body } },
     { id: 'tool-fs', name: '@deepseek-ai/dsh-tool-fs', config: { write, edit, applyPatch, readImage } },
     { id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs' },
+    {
+      id: 'compaction', name: 'cordis:group', group: true, isolate: { compaction: true },
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+      ],
+    },
   ];
   if (search) plugins.push({ id: 'tool-fs-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false } });
   // Runtime registration does not pass through Loader's !!js evaluator.
