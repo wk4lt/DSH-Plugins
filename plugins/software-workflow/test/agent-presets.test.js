@@ -6,7 +6,7 @@ import { loadAgents, parseAgentFile } from '../agent-files.js';
 import { compileAgent } from '../agent-presets.js';
 import { apply as applyPolicy } from '../mcp-policy.js';
 
-test('the shipped matrix is preserved on both platforms, with Debug patches and jobs enabled', async () => {
+test('the shipped matrix is preserved on both platforms, with jobs and compaction enabled', async () => {
   const agents = await loadAgents({ home: join(tmpdir(), 'dsh-absent-agent-home') });
   for (const agent of agents) for (const platform of ['win32', 'linux']) {
     const preset = compileAgent(agent, platform);
@@ -20,6 +20,16 @@ test('the shipped matrix is preserved on both platforms, with Debug patches and 
     assert.equal(find('tool-fs').config.edit, agent.name !== 'Test');
     assert.equal(find('tool-fs').config.applyPatch, ['Develop', 'Debug'].includes(agent.name));
     assert.deepEqual(find('tool-jobs'), { id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs' });
+    assert.deepEqual(find('compaction'), {
+      id: 'compaction',
+      name: 'cordis:group',
+      group: true,
+      isolate: { compaction: true },
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+      ],
+    });
     assert.equal(!!find(`tool-${platform === 'win32' ? 'pwsh' : 'bash'}`), agent.name !== 'Design');
     assert.equal(find(`tool-${platform === 'win32' ? 'bash' : 'pwsh'}`), undefined);
     assert.equal(find('mcp-policy'), undefined);
