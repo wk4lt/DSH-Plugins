@@ -217,8 +217,8 @@ export function remoteWorkspaceTitle(remotePath, machine) {
 export function relPathUnder(root, p) {
   const posix = (x) => {
     let n = normalizeRemotePath(x).replace(/[\\/]+$/, '')
-    const m = n.match(/^([a-zA-Z]):(.*)$/s)
-    if (m) return '/' + m[1].toLowerCase() + ':/' + (m[2] ? m[2].replace(/\\/g, '/').replace(/^\/+/, '') : '')
+    const m = n.match(/^\/?([a-zA-Z]:)([\\/].*|)$/s)
+    if (m) return '/' + m[1].toLowerCase() + m[2].replace(/\\/g, '/')
     return n.replace(/\\/g, '/')
   }
   const r = posix(root)

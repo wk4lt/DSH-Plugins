@@ -1,24 +1,19 @@
-// dsh-remote — three-way conflict-aware mirror sync (remote ⇄ local mirror).
+// dsh-remote — remote-wins mirror pulls and three-way mirror pushes.
 //
-// Why three-way: plain rsync-style pull/push silently clobbers whichever side
-// changed while the other side was edited. We keep a per-mirror snapshot of the
+// To protect remote changes during pushes, we keep a per-mirror snapshot of the
 // last-synced remote state (`.dsh-remote-sync-state.json`: relPath →
 // {mtime,size}) and compare remote (R), local (L) and last-synced (S):
 //
 //   R==S && L==S          → unchanged, skip
-//   R!=S && L==S          → remote changed → pull it (or push when pushing)
-//   R==S && L!=S          → local changed, remote untouched
-//                            • pull (rw_sync): would clobber local edit → conflict
-//                            • push (rw_push): normal upload
-//   R!=S && L!=S && R==L  → both changed to the same bytes → skip
-//   R!=S && L!=S && R!=L  → BOTH changed differently → conflict (never clobber)
+//   R!=S && L==S          → remote changed → push conflict unless forced
+//   R==S && L!=S          → local changed → normal upload
+//   R!=S && L!=S && R!=L  → both changed → push conflict unless forced
 //
-// `force: true` downgrades every conflict to a plain overwrite (rsync behavior).
 // `dryRun: true` computes the full plan without writing anything.
 // After a successful pull the local mtime is aligned to the remote mtime, and
 // after a successful push the local mtime is aligned to the remote mtime the
 // server assigned — so the invariant L==R==S holds and the next run is cheap.
-import { readdirSync, lstatSync, statSync, mkdirSync, existsSync, readFileSync, writeFileSync, utimesSync, renameSync, rmSync } from 'node:fs'
+import { chmodSync, readdirSync, lstatSync, statSync, mkdirSync, existsSync, readFileSync, writeFileSync, utimesSync, renameSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { joinRemotePath, relPathUnder } from './paths.js'
@@ -64,7 +59,39 @@ function localEntryMatches(local, directory) {
   }
 }
 
-/** Recursively pull remote → local mirror (three-way, ignore-aware). */
+/** Resolve a mirror-relative download path and check every existing component. */
+export function localDownloadPath(base, relative, directory) {
+  const names = relative ? relative.split('/') : []
+  let local = base
+  if (!localEntryMatches(base, true) || (!directory && !names.length)) {
+    throw new Error(`Expected a local directory at ${base}`)
+  }
+  for (const [i, name] of names.entries()) {
+    if (!usableLocalName(name)) throw new Error(`Invalid local download name: ${name}`)
+    local = path.join(local, name)
+    const isDirectory = i < names.length - 1 || directory
+    if (!localEntryMatches(local, isDirectory)) {
+      throw new Error(`Expected a local ${isDirectory ? 'directory' : 'file'} at ${local}`)
+    }
+  }
+  return local
+}
+
+export async function downloadFile(sftp, remote, local, remoteStat) {
+  const previous = lstatSync(local, { throwIfNoEntry: false })
+  if (previous && !previous.isFile()) throw new Error(`Expected a local file at ${local}`)
+  const temporary = path.join(path.dirname(local), '.dsh-remote-download-' + randomUUID() + '.tmp')
+  try {
+    await sftp.fastGet(remote, temporary)
+    if (previous) chmodSync(temporary, previous.mode & 0o777)
+    alignMtime(temporary, remoteStat)
+    renameSync(temporary, local)
+  } finally {
+    try { rmSync(temporary, { force: true }) } catch { /* best effort */ }
+  }
+}
+
+/** Recursively pull remote files into the local mirror. */
 export async function syncTree(sftp, remoteDir, localDir, opts = {}) {
   const {
     maxDepth = 8,
@@ -72,107 +99,97 @@ export async function syncTree(sftp, remoteDir, localDir, opts = {}) {
     maxFileBytes = 0,
     isIgnored = () => false,
     dryRun = false,
-    force = false,
     state = {},
-    protectExisting = false,
+    workspaceRoot = remoteDir,
   } = opts
-  const stats = { files: 0, dirs: 0, skippedUnchanged: 0, skippedLarge: 0, conflicts: [], staleRemote: 0, touched: [], truncated: false }
+  const stats = { files: 0, bytes: 0, dirs: 0, skippedUnchanged: 0, skippedLarge: 0, errors: [], touched: [], truncated: false }
   const nextState = { ...state }
+  let pending = 0
+  const recordError = (path, error) => stats.errors.push({ path, reason: String(error.message || error), code: error.code })
+  const recordPathError = (path, directory) => stats.errors.push({
+    path, reason: directory ? 'expected a safe local directory path' : 'expected a safe local file path', code: 'LOCAL_PATH',
+  })
 
   const walk = async (rDir, lDir, depth) => {
-    const entries = await sftp.readdir(rDir).then((l) => l || [], () => [])
+    let entries
+    try {
+      entries = await sftp.readdir(rDir) || []
+      if (!dryRun) mkdirSync(lDir, { recursive: true })
+    } catch (error) {
+      recordError(rDir, error)
+      return
+    }
     // Directories first (sequential, depth-bounded) so every file has a home.
     for (const e of entries) {
       const name = String(e.filename)
       if (name === '.' || name === '..') continue
       const isDir = !!(e.attrs && e.attrs.isDirectory && e.attrs.isDirectory())
       if (!isDir) continue
-      if (depth <= 0 || stats.files >= maxFiles) {
+      const rp = joinRemotePath(rDir, name)
+      const lp = path.join(lDir, name)
+      const rel = relPathUnder(workspaceRoot, rp)
+      if (rel !== null && isIgnored(rel, true)) continue
+      if (rel === null || !usableLocalName(name) || !localEntryMatches(lp, true)) {
+        recordPathError(rp, true)
+        continue
+      }
+      if (depth <= 0) {
         stats.truncated = true
         continue
       }
-      const rp = joinRemotePath(rDir, name)
-      const lp = path.join(lDir, name)
-      const rel = relPathUnder(remoteDir, rp) || name
-      if (isIgnored(rel, true)) continue
-      if (protectExisting && (!usableLocalName(name) || !localEntryMatches(lp, true))) {
-        stats.conflicts.push({ path: rp, reason: 'unsafe local directory' })
-        continue
-      }
-      if (!dryRun && !existsSync(lp)) mkdirSync(lp, { recursive: true })
       await walk(rp, lp, depth - 1)
       stats.dirs++
-      if (stats.files >= maxFiles) break
     }
-    if (stats.files >= maxFiles) { stats.truncated = true; return }
 
     const files = entries.filter(
       (e) => !(e.attrs && e.attrs.isDirectory && e.attrs.isDirectory()) &&
         String(e.filename) !== '.' && String(e.filename) !== '..',
     )
     await mapLimit(files, 4, async (e) => {
-      if (stats.files >= maxFiles) { stats.truncated = true; return }
       const name = String(e.filename)
       const rp = joinRemotePath(rDir, name)
       const lp = path.join(lDir, name)
-      const rel = relPathUnder(remoteDir, rp) || name
+      const rel = relPathUnder(workspaceRoot, rp)
+      if (rel === null || !usableLocalName(name)) {
+        recordPathError(rp, false)
+        return
+      }
       if (isIgnored(rel, false)) return
-      if (protectExisting && (!usableLocalName(name) || !localEntryMatches(lp, false))) {
-        stats.conflicts.push({ path: rp, reason: 'unsafe local file' })
-        return
-      }
-      let r
-      try { r = await sftp.stat(rp) } catch { return }
-      if (maxFileBytes > 0 && r.size > maxFileBytes) { stats.skippedLarge++; return }
-      const rk = remoteKey(r)
-      const sk = state[rel] ? keyOf(state[rel].size, state[rel].mtime) : null
-      let lk = null
-      if (existsSync(lp)) {
-        try { lk = localKey(statSync(lp)) } catch { lk = null }
-      }
-      if (protectExisting && !force && !sk && lk) {
-        if (!await sameFile(sftp, rp, lp, r, statSync(lp))) {
-          stats.conflicts.push({ path: rp, reason: 'local and remote files differ before the first sync' })
-        } else {
-          if (!dryRun) alignMtime(lp, r)
-          nextState[rel] = { size: r.size, mtime: r.mtime }
-          stats.skippedUnchanged++
-        }
-        return
-      }
-      if (sk && rk === sk && lk && lk === sk) { stats.skippedUnchanged++; return }
-      if (!force && sk && rk !== sk && lk && lk !== sk && rk !== lk) {
-        stats.conflicts.push({ path: rp, reason: 'both-modified（远端与本地都改过，跳过不覆盖）' })
-        return
-      }
-      if (!force && sk && rk === sk && lk && lk !== sk) {
-        // Pull would clobber a local edit; the remote never changed.
-        stats.conflicts.push({ path: rp, reason: 'local-modified（本地改过而远端未变；如需覆盖请用 force / rw_push）' })
-        return
-      }
-      if (dryRun) {
-        stats.files++
-        stats.touched.push(rp)
-        nextState[rel] = { size: r.size, mtime: r.mtime }
-        return
-      }
       try {
-        const buf = await sftp.readFile(rp)
-        writeFileSync(lp, buf)
-        try { utimesSync(lp, new Date(r.mtime * 1000), new Date(r.mtime * 1000)) } catch {}
-        stats.files++
-        stats.touched.push(rp)
-        nextState[rel] = { size: r.size, mtime: r.mtime }
-      } catch { /* skip unreadable */ }
+        const l = lstatSync(lp, { throwIfNoEntry: false })
+        if (l && !l.isFile()) {
+          recordPathError(rp, false)
+          return
+        }
+        const r = await sftp.stat(rp)
+        if (!r.isFile()) throw new Error('expected a regular remote file')
+        if (maxFileBytes > 0 && r.size > maxFileBytes) { stats.skippedLarge++; return }
+        const rk = remoteKey(r)
+        const sk = state[rel] ? keyOf(state[rel].size, state[rel].mtime) : null
+        const lk = localKey(l)
+        if (sk && rk === sk && lk === sk && await sameFile(sftp, rp, lp, r, l)) {
+          stats.skippedUnchanged++
+          return
+        }
+        if (stats.files + pending >= maxFiles) { stats.truncated = true; return }
+        pending++
+        try {
+          if (!dryRun) await downloadFile(sftp, rp, lp, r)
+          stats.files++
+          stats.bytes += r.size
+          stats.touched.push(rp)
+          nextState[rel] = { size: r.size, mtime: r.mtime }
+        } finally {
+          pending--
+        }
+      } catch (error) {
+        recordError(rp, error)
+      }
     })
   }
 
+  localDownloadPath(localDir, '', true)
   await walk(remoteDir, localDir, maxDepth)
-  if (stats.files >= maxFiles) stats.truncated = true
-  // Informational: remote entries in the snapshot that no longer exist remotely.
-  for (const rel of Object.keys(state)) {
-    if (state[rel] && !nextState[rel]) stats.staleRemote++
-  }
   return { stats, nextState }
 }
 

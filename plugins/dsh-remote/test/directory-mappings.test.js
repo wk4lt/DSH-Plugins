@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { test } from 'node:test'
 import { zstdCompressSync } from 'node:zlib'
@@ -232,8 +232,24 @@ test('explicit mappings route existing checkouts and preserve the mirror workflo
     const read = (filename) => host.call('/dsh-remote/read?sessionId=session&path=' + encodeURIComponent(filename), { method: 'GET' })
     assert.equal((await read('/projects/alpha/new.txt')).json.content, 'new local file')
     assert.equal((await read('/projects/alpha/changed.txt')).json.content, 'linux version')
-    assert.match((await transfer('pull')).json.text, /conflict/)
-    assert.equal(readFileSync(path.join(local, 'changed.txt'), 'utf8'), 'windows version')
+    assert.match((await run('rw_sync', { dryRun: true })).text, /WOULD download 1 file/)
+    const firstPull = await transfer('pull')
+    assert.equal(firstPull.status, 200, firstPull.raw)
+    assert.match(firstPull.json.text, /Downloaded 1 file/)
+    const changedFile = path.join(local, 'changed.txt')
+    assert.equal(readFileSync(changedFile, 'utf8'), 'linux version')
+
+    // Both sides differ even though their size and timestamp match the baseline.
+    const remoteChanged = ssh.fs.get('/projects/alpha/changed.txt')
+    remoteChanged.content = Buffer.from('remote update')
+    writeFileSync(changedFile, 'client update')
+    utimesSync(changedFile, remoteChanged.mtime, remoteChanged.mtime)
+    assert.match((await run('rw_sync', { dryRun: true })).text, /WOULD download 1 file/)
+    assert.equal(readFileSync(changedFile, 'utf8'), 'client update')
+    assert.match((await transfer('pull')).json.text, /Downloaded 1 file/)
+    assert.equal(readFileSync(changedFile, 'utf8'), 'remote update')
+    assert.match((await transfer('pull')).json.text, /Downloaded 0 file/)
+    assert.equal(readFileSync(path.join(local, 'new.txt'), 'utf8'), 'new local file')
     assert.equal(existsSync(path.join(local, '.dsh-remote-sync-state.json')), false)
     assert.match((await run('rw_exec', { command: 'echo mapped' })).text, /mapped/)
     assert(ssh.execLog.some(command => command.includes("'/projects/alpha'") && command.includes('echo mapped')))
@@ -296,7 +312,7 @@ test('explicit mappings route existing checkouts and preserve the mirror workflo
     assert.equal((await deleteServer()).status, 404)
     assert.deepEqual((await host.call('/dsh-remote/mappings', { method: 'GET' })).json.mappings, [beta])
     assert(existsSync(path.join(mirror.json.localMirror, '.dsh-remote-meta.json')))
-    assert.equal(readFileSync(path.join(local, 'changed.txt'), 'utf8'), 'windows version')
+    assert.equal(readFileSync(path.join(local, 'changed.txt'), 'utf8'), 'remote update')
     await assert.rejects(host.tool('rw_list_dir').execute({}, {
       agent: { session: { header: { cwd: mirror.json.localMirror } } },
     }), /saved SSH server for this workspace is unavailable/)
@@ -305,4 +321,62 @@ test('explicit mappings route existing checkouts and preserve the mirror workflo
     await promptFiber?.dispose()
     await ssh.close()
   }
+})
+
+test('sidebar download merges a remote directory into its existing mapped local directory', async t => {
+  const ssh = await startFakeSsh({ fs: {
+    '/projects/alpha/pespopw/build.sh': 'remote build',
+    '/projects/alpha/pespopw/src/bin.dat': Buffer.from([0, 255, 128]),
+    '/projects/alpha/pespopw/.git/config': 'ignored metadata',
+  } })
+  t.after(() => ssh.close())
+  ssh.fs.mkdir('/projects/alpha/pespopw/docs')
+  const sessions = new Map()
+  const server = machine(ssh.machine({ id: 'server' }))
+  const host = await createHost({ machines: [server], services: { sessions: { get: id => sessions.get(id) } } })
+  t.after(() => host.dispose())
+  const checkout = path.join(host.home, 'checkout')
+  const directory = path.join(checkout, 'pespopw')
+  mkdirSync(directory, { recursive: true })
+  writeFileSync(path.join(directory, 'build.sh'), 'local build')
+  writeFileSync(path.join(directory, 'local.txt'), 'local only')
+  const saved = await host.call('/dsh-remote/mappings', { body: {
+    action: 'save', machineId: server.id, localPath: checkout, remotePath: '/projects/alpha',
+  } })
+  assert.equal(saved.status, 200, saved.raw)
+  const mapping = saved.json.mapping
+  const mirror = await host.call('/dsh-remote/mirror', { body: {
+    machineId: server.id, path: mapping.remotePath, mappingId: mapping.id, mappingRevision: mapping.revision,
+  } })
+  assert.equal(mirror.status, 200, mirror.raw)
+  sessions.set('mapped', { id: 'mapped', header: { cwd: mirror.json.localMirror } })
+  const remoteDir = '/projects/alpha/pespopw'
+  const download = filename => host.call('/dsh-remote/fs', { body: {
+    sessionId: 'mapped', op: 'download', path: filename,
+  } })
+
+  const result = await download(remoteDir)
+  assert.equal(result.status, 200, result.raw)
+  assert.equal(result.json.local, directory)
+  assert.equal(result.json.files, 2)
+  assert.equal(readFileSync(path.join(directory, 'build.sh'), 'utf8'), 'remote build')
+  assert.deepEqual(readFileSync(path.join(directory, 'src', 'bin.dat')), Buffer.from([0, 255, 128]))
+  assert(existsSync(path.join(directory, 'docs')))
+  assert.equal(existsSync(path.join(directory, '.git')), false)
+  assert.equal(readFileSync(path.join(directory, 'local.txt'), 'utf8'), 'local only')
+  assert.equal(existsSync(path.join(directory, 'pespopw')), false)
+  assert.equal((await download(remoteDir)).json.files, 0)
+
+  writeFileSync(path.join(directory, 'build.sh'), 'local edit')
+  const file = await download(remoteDir + '/build.sh')
+  assert.equal(file.status, 200, file.raw)
+  assert.equal(readFileSync(path.join(directory, 'build.sh'), 'utf8'), 'remote build')
+
+  ssh.fs.write(remoteDir + '/local.txt/child', 'type mismatch')
+  ssh.fs.write(remoteDir + '/new.txt', 'download alongside the mismatch')
+  const partial = await download(remoteDir)
+  assert.equal(partial.status, 409, partial.raw)
+  assert.match(partial.json.error, /expected a safe local directory path/)
+  assert.equal(readFileSync(path.join(directory, 'local.txt'), 'utf8'), 'local only')
+  assert.equal(readFileSync(path.join(directory, 'new.txt'), 'utf8'), 'download alongside the mismatch')
 })

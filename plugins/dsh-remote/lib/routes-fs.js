@@ -7,9 +7,10 @@
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import {
-  normalizeRemotePath, joinRemotePath, remoteDirname, mkdirRemoteDirs, toDisplayPath,
+  normalizeRemotePath, joinRemotePath, remoteDirname, mkdirRemoteDirs, relPathUnder, toDisplayPath, toSftpPath,
 } from './paths.js'
 import { listDirStructured, listRemoteDrives, removeRemoteTree, previewRemoteFile } from './remote-fs.js'
+import { downloadFile, localDownloadPath, loadSyncState, saveSyncState, syncTree } from './sync.js'
 
 export function createFsRoutes({
   sendJson,
@@ -20,6 +21,8 @@ export function createFsRoutes({
   audit,
   config,
   mirrorDirFor,
+  ignoreMatcher,
+  runWorkspaceTransfer,
 }) {
   const bindOrReply = async (req, res, body = {}) => {
     try {
@@ -240,18 +243,59 @@ export function createFsRoutes({
             const ws = b.ws
             if (!p || p === '/') return sendJson(res, 400, { ok: false, error: 'path required' })
             if (!ws) return sendJson(res, 400, { ok: false, error: 'no remote workspace set' })
-            const st = await sftp.stat(p).catch(() => null)
-            if (!st) return sendJson(res, 404, { ok: false, error: 'not found' })
-            if (config.maxFileBytes > 0 && st.size > config.maxFileBytes) {
-              return sendJson(res, 400, { ok: false, error: `file is ${st.size} bytes (over ${config.maxFileBytes} cap)` })
+            if (p.startsWith('/') && p.includes('\\')) {
+              return sendJson(res, 400, { ok: false, error: 'Invalid character in remote download path' })
             }
             const base = b.mirrorDir || mirrorDirFor(ws, b.host, b.username, b.port)
-            const rel = p.startsWith(ws) ? p.slice(ws.length).replace(/^\/+/, '') : p.slice(1)
-            const local = path.join(base, rel)
-            mkdirSync(path.dirname(local), { recursive: true })
-            await sftp.fastGet(p, local)
-            audit('download', `download ${p}`, 0, b)
-            return sendJson(res, 200, { ok: true, bytes: st.size, local })
+            const workspaceRel = relPathUnder(ws, p)
+            const rel = workspaceRel ?? toSftpPath(p).replace(/^\//, '')
+            return await runWorkspaceTransfer(base, b.mapping, b.syncFile, async () => {
+              const st = await sftp.stat(p).catch(error => {
+                if (error.code === 2 || error.code === 'ENOENT') return null
+                throw error
+              })
+              if (!st) return sendJson(res, 404, { ok: false, error: 'not found' })
+              const directory = st.isDirectory()
+              if (!directory && !st.isFile()) {
+                return sendJson(res, 400, { ok: false, error: 'Expected a regular remote file or directory' })
+              }
+              if (!directory && config.maxFileBytes > 0 && st.size > config.maxFileBytes) {
+                return sendJson(res, 400, { ok: false, error: `file is ${st.size} bytes (over ${config.maxFileBytes} cap)` })
+              }
+              const local = localDownloadPath(base, rel, directory)
+              const workspaceRoot = workspaceRel === null ? p : ws
+              const isIgnored = ignoreMatcher(workspaceRoot)
+              const reserved = rel.split('/').some(name => /^\.dsh-remote-(meta|sync-state)\.json$/i.test(name))
+              if (reserved || (directory && rel && isIgnored(rel, true))) {
+                return sendJson(res, 400, { ok: false, error: `Download path is ignored: ${p}` })
+              }
+              const state = workspaceRel === null ? {} : loadSyncState(base, b.syncFile)
+              if (directory) {
+                const { stats, nextState } = await syncTree(sftp, p, local, {
+                  maxFileBytes: config.maxFileBytes, workspaceRoot, state, isIgnored,
+                })
+                if (workspaceRel !== null) saveSyncState(base, nextState, b.syncFile)
+                const details = stats.errors.slice(0, 10).map(({ path, reason }) => `${path}: ${reason}`)
+                if (stats.errors.length > 10) details.push(`${stats.errors.length - 10} more paths failed`)
+                if (stats.skippedLarge) details.push(`${stats.skippedLarge} file(s) exceeded the size limit`)
+                if (stats.truncated) details.push('Reached the directory depth or file count limit')
+                if (details.length) {
+                  const error = `Downloaded ${stats.files} file(s) to ${local}.\n${details.join('\n')}`
+                  const status = stats.errors.some(e => e.code !== 'LOCAL_PATH') ? 500 : 409
+                  return sendJson(res, status, { ok: false, error, local, files: stats.files })
+                }
+                audit('download', `download ${p}`, 0, b)
+                return sendJson(res, 200, { ok: true, bytes: stats.bytes, local, files: stats.files })
+              }
+              mkdirSync(path.dirname(local), { recursive: true })
+              await downloadFile(sftp, p, local, st)
+              if (workspaceRel !== null) {
+                state[workspaceRel] = { size: st.size, mtime: st.mtime }
+                saveSyncState(base, state, b.syncFile)
+              }
+              audit('download', `download ${p}`, 0, b)
+              return sendJson(res, 200, { ok: true, bytes: st.size, local })
+            })
           }
           return sendJson(res, 400, { ok: false, error: 'unknown op' })
         } catch (err) {
