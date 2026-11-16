@@ -1817,12 +1817,11 @@ export async function apply(ctx, config) {
     defineTool({
       name: 'rw_sync',
       description:
-        'Download the current remote workspace into its local mirror directory over SFTP (bounded, three-way conflict-aware). Makes the remote files visible/editable locally so the DSH native workspace / fs tools can operate on them. Conflicts (both sides modified) are reported and never overwritten; use force=true to override.',
+        'Download the current remote workspace into its local mirror over SFTP. Remote files overwrite differing local files.',
       parameters: {
         depth: { type: 'integer', description: 'Max directory depth to mirror (default 8)' },
         maxFiles: { type: 'integer', description: 'Max files to download (default 2000)' },
         dryRun: { type: 'boolean', description: 'Compute the plan without downloading (default false)' },
-        force: { type: 'boolean', description: 'Overwrite conflicting files (default false)' },
         async: { type: 'boolean', description: 'Run in the background and return a task id (default false)' },
       },
       output: textOut,
@@ -1836,7 +1835,7 @@ export async function apply(ctx, config) {
         const depth = Math.min(Math.max(Number(args.depth) || 8, 1), 16)
         const maxFiles = Math.min(Math.max(Number(args.maxFiles) || 2000, 1), 20000)
         const isIgnored = ignoreMatcher(p)
-        const body = { depth, maxFiles, dryRun: !!args.dryRun, force: !!args.force, isIgnored, protectExisting: !!b.mapping }
+        const body = { maxDepth: depth, maxFiles, dryRun: !!args.dryRun, isIgnored }
         const runSync = async () => {
           let sftp
           try {
@@ -1848,15 +1847,13 @@ export async function apply(ctx, config) {
           const { stats, nextState } = await syncTree(sftp, p, local, { ...body, state, maxFileBytes: config.maxFileBytes })
           if (!args.dryRun) saveSyncState(local, nextState, b.syncFile)
           let text = `${args.dryRun ? 'WOULD download' : 'Downloaded'} ${stats.files} file(s) from ${p} → ${local}.`
-          if (stats.truncated || stats.files >= maxFiles) text += ` TRUNCATED (hit depth=${depth} or maxFiles=${maxFiles} cap; raise maxFiles/depth and re-run).`
+          if (stats.truncated) text += ` TRUNCATED (hit depth=${depth} or maxFiles=${maxFiles} cap; raise maxFiles/depth and re-run).`
           if (stats.skippedUnchanged) text += ` ${stats.skippedUnchanged} unchanged.`
           if (stats.skippedLarge) text += ` ${stats.skippedLarge} too large (over ${config.maxFileBytes} bytes).`
-          if (stats.staleRemote) text += ` ${stats.staleRemote} remote entries gone (kept locally; use rw_push to mirror deletions).`
-          if (stats.conflicts.length) {
-            text += `\n⚠ ${stats.conflicts.length} conflict(s), NOT overwritten:`
-            for (const c of stats.conflicts.slice(0, 10)) text += `\n  ${c.path} — ${c.reason}`
-            if (stats.conflicts.length > 10) text += `\n  … and ${stats.conflicts.length - 10} more`
-            text += '\n(use force=true to override)'
+          if (stats.errors.length) {
+            text += `\n⚠ ${stats.errors.length} download error(s):`
+            for (const e of stats.errors.slice(0, 10)) text += `\n  ${e.path} — ${e.reason}`
+            if (stats.errors.length > 10) text += `\n  … and ${stats.errors.length - 10} more`
           }
           return { text }
         }
@@ -2458,11 +2455,12 @@ export async function apply(ctx, config) {
           const rel = p.startsWith(ws) ? p.slice(ws.length).replace(/^\/+/, '') : p.slice(1)
           local = path.join(base, rel)
         }
-        mkdirSync(path.dirname(local), { recursive: true })
-        const st = await sftp.stat(p).catch(() => null)
-        if (config.maxFileBytes > 0 && st && st.size > config.maxFileBytes) {
+        const st = await sftp.stat(p)
+        if (!st.isFile()) throw new Error(`rw_download: expected a remote file at ${p}`)
+        if (config.maxFileBytes > 0 && st.size > config.maxFileBytes) {
           throw new Error(`rw_download: file is ${st.size} bytes (over ${config.maxFileBytes} cap)`)
         }
+        mkdirSync(path.dirname(local), { recursive: true })
         await sftp.fastGet(p, local)
         const bytes = existsSync(local) ? statSync(local).size : 0
         return { ok: true, bytes, text: `downloaded ${bytes} bytes from ${p} → ${local}` }
@@ -3567,6 +3565,7 @@ export async function apply(ctx, config) {
     },
     ...createFsRoutes({
       sendJson, readBody, resolveRequestBinding, decodeBuf, encodeText, audit, config, mirrorDirFor,
+      ignoreMatcher, runWorkspaceTransfer,
     }),
 
     // Embedded terminal (P1): one host-owned PTY session per machine, polled.

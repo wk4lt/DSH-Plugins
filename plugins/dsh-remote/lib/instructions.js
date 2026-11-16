@@ -146,8 +146,7 @@ const localKeyOf = (st) => (st ? keyOf(st.size, st.mtimeMs / 1000) : null)
  *   - local missing                        → write (+ align mtime, record state)
  *   - local identical to remote            → keep (record state if absent)
  *   - remote changed, local untouched (L==S) → write (a plain pull)
- *   - local edited (L!=S), remote unchanged → SKIP — a local edit is never
- *     clobbered; rw_sync surfaces it as a conflict like any other file
+ *   - local edited (L!=S), remote unchanged → SKIP until an explicit rw_sync
  *   - both changed / unknown local content → SKIP (rw_sync arbitrates)
  *
  * @returns {{written: string[], present: Set<string>}} rel paths written now,
