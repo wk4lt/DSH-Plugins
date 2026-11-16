@@ -15,14 +15,16 @@ dsh web
 
 ### Windows 桌面版和内网镜像
 
-完全退出 DSH Desktop 后，在解压的仓库根目录用桌面版注册的 `dsh` 命令安装。将下面的地址替换成内网现有的 npm 镜像。浏览器版使用 `--profile web`。
+完全退出 DSH Desktop 后，在最新源码的仓库根目录用桌面版注册的 `dsh` 命令安装。将下面的地址替换成内网现有的 npm 镜像。浏览器版使用 `--profile web`。
 
 ```powershell
 $Registry = 'https://npm-mirror.example.internal/'
 dsh plugin --profile desktop add 'file:./plugins/dsh-remote' --registry $Registry
 ```
 
-源码可以直接从 ZIP 解压使用。保留 `file:` 前缀，profile 安装器会安装插件的运行依赖。裸目录路径默认会创建 `link:`，此时依赖必须已经安装在源码目录里。若已通过 `link:` 安装此插件，先用 `dsh plugin --profile desktop remove @wk4lt/dsh-remote` 移除旧链接，再执行安装命令。浏览器版使用对应的 `web` profile。
+源码可以直接从 ZIP 解压使用。保留 `file:` 前缀，profile 安装器会安装插件的运行依赖。裸目录路径默认会创建 `link:`，此时依赖必须已经安装在源码目录里。
+
+**从旧版升级**时，`git pull` 只更新源码目录，通过 `file:` 安装到 profile 的副本需要重装。先执行 `dsh plugin --profile desktop remove @wk4lt/dsh-remote`，再从新源码目录执行上面的安装命令。重新打开 DSH 后，在插件详情确认 `@wk4lt/dsh-remote` 为 `0.1.12`，远程会话顶部应显示「拉取并覆盖本地」。
 
 插件随包提供裁剪后的 `ssh2@1.17.0`，不包含原生加速模块或安装构建脚本，无需批准 pnpm 构建脚本。加密使用 Node 内置 OpenSSL，Poly1305 使用上游 JavaScript/WebAssembly 实现；SSH/SFTP 功能完整，大批量传输可能略慢于原生加速版本。来源、裁剪内容和升级流程见 [vendor/ssh2/VENDOR.md](vendor/ssh2/VENDOR.md)。
 
